@@ -244,6 +244,7 @@ final class ARDisplayManager: NSObject {
             result([
                 "supported": true,
                 "connected": isDisplayConnected || registrationAvailable,
+                "available": registrationAvailable,
                 "screenWidth": screenWidth,
                 "screenHeight": screenHeight,
             ])
@@ -341,8 +342,17 @@ final class ARDisplayManager: NSObject {
         startTimeoutWorkItem = nil
         guard let pending = startPendingResult else { return }
         startPendingResult = nil
+        var available = false
+        var enabled = false
+        if #available(iOS 27.0, *) {
+            available = registeredAccessory?.isAvailable ?? false
+            enabled = registeredAccessory?.isEnabled ?? false
+        }
+        arLog("start timed out: available=\(available) enabled=\(enabled) connected=\(isDisplayConnected)")
         teardownPlayback(keepingExternalDisplay: false)
-        pending(ARDisplayManager.startFailure("未检测到外接屏，请确认眼镜已用 USB‑C 连接"))
+        pending(ARDisplayManager.startFailure(
+            "未检测到外接屏，请确认眼镜已用 USB‑C 连接（available=\(available) enabled=\(enabled)）"
+        ))
     }
 
     private func resolvePendingStartIfPossible() {
