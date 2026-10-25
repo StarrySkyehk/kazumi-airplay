@@ -106,6 +106,7 @@ class _PlayerItemState extends State<PlayerItem>
   static const double _arDanmakuFontScaleMin = 0.5;
   static const double _arDanmakuFontScaleMax = 2.0;
   bool _arDisplayInProgress = false;
+  bool _arConnectingDialogVisible = false;
 
   late double _danmakuArea;
   late bool _hideTop;
@@ -1166,6 +1167,46 @@ class _PlayerItemState extends State<PlayerItem>
     return 1;
   }
 
+  /// 连接外接屏可能耗时（等系统创建外接屏场景），期间给用户一个不可取消的提示。
+  void _showArConnectingDialog() {
+    if (_arConnectingDialogVisible || !mounted) {
+      return;
+    }
+    _arConnectingDialogVisible = true;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext dialogContext) {
+        return const PopScope(
+          canPop: false,
+          child: AlertDialog(
+            content: Row(
+              children: <Widget>[
+                SizedBox(
+                  width: 22,
+                  height: 22,
+                  child: CircularProgressIndicator(strokeWidth: 2.5),
+                ),
+                SizedBox(width: 16),
+                Expanded(child: Text('正在连接 AR 眼镜…')),
+              ],
+            ),
+          ),
+        );
+      },
+    ).whenComplete(() {
+      _arConnectingDialogVisible = false;
+    });
+  }
+
+  void _hideArConnectingDialog() {
+    if (!_arConnectingDialogVisible || !mounted) {
+      return;
+    }
+    _arConnectingDialogVisible = false;
+    Navigator.of(context, rootNavigator: true).pop();
+  }
+
   /// 把 mpv 暂停后交给原生 AVPlayer，成功后进入手机遥控页；退出时回传原生
   /// 播放位置并恢复 mpv。
   Future<void> _startArDisplay() async {
@@ -1190,6 +1231,7 @@ class _PlayerItemState extends State<PlayerItem>
     // 暂停期间停掉每秒同步：否则 paused 的 media_kit 状态会写入 audio_service
     // 并释放原生播放需要的 AVAudioSession，同时还会为空转的进度发弹幕。
     playerTimer?.cancel();
+    _showArConnectingDialog();
     try {
       await playerController.pause();
       final ARDisplayStartResult startResult = await ARDisplayService.start(
@@ -1204,6 +1246,7 @@ class _PlayerItemState extends State<PlayerItem>
             .clamp(_arDanmakuFontScaleMin, _arDanmakuFontScaleMax)
             .toDouble(),
       );
+      _hideArConnectingDialog();
       if (!mounted) {
         // 播放页已销毁：别让原生侧留下无人控制的播放。
         unawaited(ARDisplayService.stop());
@@ -1262,6 +1305,7 @@ class _PlayerItemState extends State<PlayerItem>
         );
       }
     } finally {
+      _hideArConnectingDialog();
       _arDisplayInProgress = false;
     }
   }

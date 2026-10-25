@@ -65,6 +65,14 @@ import app_links
         // AR glasses (external display) playback: method + event channels.
         // Sibling of com.predidit.kazumi/intent and com.predidit.kazumi/storage.
         ARDisplayManager.shared.attach(with: engineBridge.applicationRegistrar.messenger())
+        // Pre-register the iOS 27 external-display scene accessory (disabled) once the root
+        // view controller exists, so the system can present the AR glasses screen as soon as
+        // the user starts external playback.
+        arRunOnMainActor {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                ARDisplayManager.shared.prepareAccessoryRegistrationIfNeeded()
+            }
+        }
     }
 
     // TODO: ADD VLC SUPPORT

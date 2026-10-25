@@ -112,7 +112,7 @@ final class ARDisplayManager: NSObject {
     private static let methodChannelName = "com.predidit.kazumi/ar_display"
     private static let eventChannelName = "com.predidit.kazumi/ar_display_events"
     private static let sceneConfigurationName = "KazumiARDisplayAccessory"
-    private static let startTimeoutSeconds: TimeInterval = 1.5
+    private static let startTimeoutSeconds: TimeInterval = 8.0
     private static let stateEventIntervalSeconds: Double = 0.25
 
     // MARK: Flutter
@@ -134,6 +134,11 @@ final class ARDisplayManager: NSObject {
     private var isDisplayConnected = false
     private var screenWidth = 0
     private var screenHeight = 0
+    /// Fallback path for iOS builds where the scene accessory never connects but the wired
+    /// display is still exposed as a `UIScreen` (classic multiple-display API).
+    private var legacyExternalWindow: UIWindow?
+    private var screenConnectObserver: NSObjectProtocol?
+    private var screenDisconnectObserver: NSObjectProtocol?
 
     // MARK: Playback
 
@@ -245,6 +250,7 @@ final class ARDisplayManager: NSObject {
                 "supported": true,
                 "connected": isDisplayConnected || registrationAvailable,
                 "available": registrationAvailable,
+                "screens": UIScreen.screens.count,
                 "screenWidth": screenWidth,
                 "screenHeight": screenHeight,
             ])
@@ -340,19 +346,98 @@ final class ARDisplayManager: NSObject {
 
     private func handleStartTimeout() {
         startTimeoutWorkItem = nil
-        guard let pending = startPendingResult else { return }
-        startPendingResult = nil
+        guard startPendingResult != nil else { return }
         var available = false
         var enabled = false
         if #available(iOS 27.0, *) {
             available = registeredAccessory?.isAvailable ?? false
             enabled = registeredAccessory?.isEnabled ?? false
         }
-        arLog("start timed out: available=\(available) enabled=\(enabled) connected=\(isDisplayConnected)")
+        let screens = UIScreen.screens.count
+        arLog("start timed out: available=\(available) enabled=\(enabled) screens=\(screens)")
+
+        // Fallback 1: the accessory scene never connected, but the wired display may still be
+        // exposed through the legacy UIScreen API. Try to host the player there directly.
+        if attachLegacyExternalScreenIfAvailable() {
+            arLog("falling back to legacy UIScreen window")
+            resolvePendingStartIfPossible()
+            return
+        }
+
+        guard let pending = startPendingResult else { return }
+        startPendingResult = nil
         teardownPlayback(keepingExternalDisplay: false)
         pending(ARDisplayManager.startFailure(
-            "未检测到外接屏，请确认眼镜已用 USB‑C 连接（available=\(available) enabled=\(enabled)）"
+            "未检测到外接屏，请确认眼镜已用 USB‑C 连接（available=\(available) enabled=\(enabled) screens=\(screens)）"
         ))
+    }
+
+    /// Classic multiple-display fallback: attach the player to `UIScreen.screens[1]`.
+    ///
+    /// Only used when the iOS 27 scene accessory does not connect. Returns `true` when a
+    /// legacy external window is now hosting the player.
+    @discardableResult
+    private func attachLegacyExternalScreenIfAvailable() -> Bool {
+        let screens = UIScreen.screens
+        guard screens.count > 1 else { return false }
+        if displayViewController != nil {
+            return true
+        }
+        let screen = screens[1]
+        let viewController = ARDisplayPlayerViewController()
+        let window = UIWindow(frame: screen.bounds)
+        window.screen = screen
+        window.rootViewController = viewController
+        window.isHidden = false
+        legacyExternalWindow = window
+        displayViewController = viewController
+        isDisplayConnected = true
+        screenWidth = Int((screen.bounds.width * screen.scale).rounded())
+        screenHeight = Int((screen.bounds.height * screen.scale).rounded())
+        arLog("legacy external window attached: \(screenWidth)x\(screenHeight)")
+        sendEvent([
+            "type": "connected",
+            "width": screenWidth,
+            "height": screenHeight,
+        ])
+        attachPlayerToExternalDisplay()
+        return true
+    }
+
+    /// Pre-registers the scene accessory (disabled) so the system already knows about it when
+    /// playback starts. Called shortly after app launch from `AppDelegate`.
+    func prepareAccessoryRegistrationIfNeeded() {
+        guard #available(iOS 27.0, *) else { return }
+        guard registeredAccessory == nil else { return }
+        guard let hostViewController = ARDisplayManager.activeFlutterViewController() else { return }
+        _ = ensureAccessoryRegistration(hostViewController: hostViewController)
+        setAccessoryEnabled(false)
+        startObservingExternalScreens()
+        arLog("accessory pre-registered, available=\(registeredAccessory?.isAvailable ?? false)")
+    }
+
+    private func startObservingExternalScreens() {
+        guard screenConnectObserver == nil else { return }
+        screenConnectObserver = NotificationCenter.default.addObserver(
+            forName: UIScreen.didConnectNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            arRunOnMainActor {
+                self?.arLog("UIScreen did connect, count=\(UIScreen.screens.count)")
+            }
+        }
+        screenDisconnectObserver = NotificationCenter.default.addObserver(
+            forName: UIScreen.didDisconnectNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            arRunOnMainActor {
+                guard let self = self, self.legacyExternalWindow != nil else { return }
+                self.arLog("legacy external screen disconnected")
+                self.teardownPlayback(keepingExternalDisplay: false)
+            }
+        }
     }
 
     private func resolvePendingStartIfPossible() {
@@ -547,6 +632,7 @@ final class ARDisplayManager: NSObject {
             name: ARDisplayManager.sceneConfigurationName,
             sessionRole: .windowExternalDisplayNonInteractive
         )
+        configuration.sceneClass = UIWindowScene.self
         configuration.delegateClass = ARDisplaySceneDelegate.self
         // Use the variant without `userInfo`: the `userInfo:` overload takes a
         // non-optional `Any` (verified by the Xcode 27 SDK build), and we do not
@@ -617,6 +703,11 @@ final class ARDisplayManager: NSObject {
             return
         }
 
+        if let window = legacyExternalWindow {
+            window.isHidden = true
+            window.rootViewController = nil
+            legacyExternalWindow = nil
+        }
         displayViewController = nil
         sceneDelegate?.closeWindow()
         sceneDelegate = nil

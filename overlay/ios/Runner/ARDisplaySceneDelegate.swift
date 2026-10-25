@@ -16,6 +16,7 @@ import UIKit
 ///
 /// Inherits from `UIResponder` (same shape as Apple's own `SceneDelegate` template) so the
 /// scene delegate callbacks are main-actor isolated like the UIKit calls they perform.
+@objc(ARDisplaySceneDelegate)
 final class ARDisplaySceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     /// Required by `UIWindowSceneDelegate`; the scene system may also assign it.
