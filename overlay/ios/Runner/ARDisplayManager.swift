@@ -111,7 +111,6 @@ final class ARDisplayManager: NSObject {
 
     private static let methodChannelName = "com.predidit.kazumi/ar_display"
     private static let eventChannelName = "com.predidit.kazumi/ar_display_events"
-    private static let sceneConfigurationName = "KazumiARDisplayAccessory"
     private static let startTimeoutSeconds: TimeInterval = 8.0
     private static let stateEventIntervalSeconds: Double = 0.25
 
@@ -628,11 +627,11 @@ final class ARDisplayManager: NSObject {
             accessoryHostViewController = hostViewController
             return true
         }
-        let configuration = UISceneConfiguration(
-            name: ARDisplayManager.sceneConfigurationName,
-            sessionRole: .windowExternalDisplayNonInteractive
-        )
-        configuration.sceneClass = UIWindowScene.self
+        // Follow Apple's iOS 27 sample exactly: a *nameless* configuration whose role the
+        // system fills in for the accessory (a named configuration would be looked up in the
+        // Info.plist scene manifest, which is the alternative wiring and did not connect in
+        // our first attempt), with only the scene delegate class set.
+        let configuration = UISceneConfiguration()
         configuration.delegateClass = ARDisplaySceneDelegate.self
         // Use the variant without `userInfo`: the `userInfo:` overload takes a
         // non-optional `Any` (verified by the Xcode 27 SDK build), and we do not
