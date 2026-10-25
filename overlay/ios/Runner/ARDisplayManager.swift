@@ -421,20 +421,19 @@ final class ARDisplayManager: NSObject {
             forName: UIScreen.didConnectNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
-            arRunOnMainActor {
-                self?.arLog("UIScreen did connect, count=\(UIScreen.screens.count)")
-            }
+        ) { _ in
+            arLog("UIScreen did connect, count=\(UIScreen.screens.count)")
         }
         screenDisconnectObserver = NotificationCenter.default.addObserver(
             forName: UIScreen.didDisconnectNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
+            guard let manager = self else { return }
             arRunOnMainActor {
-                guard let self = self, self.legacyExternalWindow != nil else { return }
-                self.arLog("legacy external screen disconnected")
-                self.teardownPlayback(keepingExternalDisplay: false)
+                guard manager.legacyExternalWindow != nil else { return }
+                arLog("legacy external screen disconnected")
+                manager.teardownPlayback(keepingExternalDisplay: false)
             }
         }
     }
@@ -642,6 +641,7 @@ final class ARDisplayManager: NSObject {
         let registration = hostViewController.registerSceneAccessory(accessory)
         registeredAccessory = registration
         accessoryHostViewController = hostViewController
+        startObservingExternalScreens()
         return true
     }
 
