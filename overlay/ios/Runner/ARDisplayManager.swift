@@ -573,7 +573,15 @@ final class ARDisplayManager: NSObject {
             "type": "connected",
             "width": screenWidth,
             "height": screenHeight,
+            "windowVisible": isExternalWindowVisible(),
         ])
+        // Re-assert visibility on the next runloop: some iOS builds create the accessory scene
+        // while the phone display is still being mirrored.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.assertExternalWindowVisible()
+            self.sendStateEvent()
+        }
         attachPlayerToExternalDisplay()
         resolvePendingStartIfPossible()
     }
@@ -592,6 +600,37 @@ final class ARDisplayManager: NSObject {
         if player != nil || startPendingResult != nil {
             teardownPlayback(keepingExternalDisplay: false)
         }
+    }
+
+    /// Whether our external-display window is actually on screen (not just created).
+    private func isExternalWindowVisible() -> Bool {
+        if let window = sceneDelegate?.window {
+            return !window.isHidden && window.windowScene != nil
+        }
+        if let window = legacyExternalWindow {
+            return !window.isHidden
+        }
+        return false
+    }
+
+    private func assertExternalWindowVisible() {
+        if let window = sceneDelegate?.window {
+            if window.isHidden || window.windowScene == nil {
+                window.isHidden = false
+            }
+            if !window.isKeyWindow {
+                window.makeKey()
+            }
+        } else if let window = legacyExternalWindow, window.isHidden {
+            window.isHidden = false
+        }
+    }
+
+    private func externalSceneStateDescription() -> String {
+        if let scene = externalWindowScene {
+            return String(describing: scene.activationState)
+        }
+        return legacyExternalWindow == nil ? "none" : "legacy"
     }
 
     private func updateScreenMetrics(from windowScene: UIWindowScene) {
@@ -848,6 +887,8 @@ final class ARDisplayManager: NSObject {
             "durationMs": currentDurationMilliseconds(),
             "buffering": timeControlStatus == .waitingToPlayAtSpecifiedRate,
             "ended": playbackEnded,
+            "windowVisible": isExternalWindowVisible(),
+            "sceneState": externalSceneStateDescription(),
         ]
         if let lastKnownError = lastKnownError {
             payload["error"] = lastKnownError

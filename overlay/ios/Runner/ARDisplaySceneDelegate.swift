@@ -36,10 +36,12 @@ final class ARDisplaySceneDelegate: UIResponder, UIWindowSceneDelegate {
         let window = UIWindow(windowScene: windowScene)
         let viewController = ARDisplayPlayerViewController()
         window.rootViewController = viewController
-        window.isHidden = false
-
         self.window = window
         self.playerViewController = viewController
+        // The system keeps mirroring the phone screen until the accessory scene presents a
+        // visible window; `makeKeyAndVisible()` is what Apple's sample uses here, and it is
+        // required for the external display to switch from mirroring to our content.
+        window.makeKeyAndVisible()
 
         ARDisplayManager.shared.handleExternalSceneConnected(
             windowScene: windowScene,

@@ -317,6 +317,7 @@ sealed class ARDisplayEvent {
         return ARDisplayConnectedEvent(
           width: _asInt(map['width']),
           height: _asInt(map['height']),
+          windowVisible: map['windowVisible'] != false,
         );
       case 'disconnected':
         return const ARDisplayDisconnectedEvent();
@@ -328,6 +329,8 @@ sealed class ARDisplayEvent {
           buffering: map['buffering'] == true,
           ended: map['ended'] == true,
           error: _asOptionalString(map['error']),
+          windowVisible: map['windowVisible'] != false,
+          sceneState: _asOptionalString(map['sceneState']),
         );
       case 'error':
         return ARDisplayErrorEvent(
@@ -344,10 +347,14 @@ class ARDisplayConnectedEvent extends ARDisplayEvent {
   const ARDisplayConnectedEvent({
     required this.width,
     required this.height,
+    this.windowVisible = true,
   });
 
   final int width;
   final int height;
+
+  /// 原生外接屏窗口是否真的已经显示（用于排查「场景已连接但仍镜像」问题）。
+  final bool windowVisible;
 }
 
 /// 外接屏已断开。
@@ -364,6 +371,8 @@ class ARDisplayStateEvent extends ARDisplayEvent {
     required this.buffering,
     required this.ended,
     this.error,
+    this.windowVisible = true,
+    this.sceneState,
   });
 
   final bool playing;
@@ -372,6 +381,12 @@ class ARDisplayStateEvent extends ARDisplayEvent {
   final bool buffering;
   final bool ended;
   final String? error;
+
+  /// 原生外接屏窗口是否已经显示。
+  final bool windowVisible;
+
+  /// 原生外接屏场景的激活状态（诊断用，如 foregroundActive）。
+  final String? sceneState;
 }
 
 /// 致命错误（如 AVPlayerItem 失败）。

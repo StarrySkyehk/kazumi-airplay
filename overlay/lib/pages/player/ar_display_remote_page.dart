@@ -54,6 +54,8 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
   double? _dragPositionMs;
   int _screenWidth = 0;
   int _screenHeight = 0;
+  bool _windowVisible = true;
+  String? _sceneState;
 
   bool get _canControl => _connected && _error == null;
 
@@ -97,11 +99,16 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
       return;
     }
     switch (event) {
-      case ARDisplayConnectedEvent(:final width, :final height):
+      case ARDisplayConnectedEvent(
+          :final width,
+          :final height,
+          :final windowVisible,
+        ):
         setState(() {
           _connected = true;
           _screenWidth = width;
           _screenHeight = height;
+          _windowVisible = windowVisible;
         });
       case ARDisplayDisconnectedEvent():
         setState(() {
@@ -115,11 +122,15 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
           :final buffering,
           :final ended,
           :final error,
+          :final windowVisible,
+          :final sceneState,
         ):
         setState(() {
           _playing = playing;
           _buffering = buffering;
           _ended = ended;
+          _windowVisible = windowVisible;
+          _sceneState = sceneState;
           if (durationMs > 0) {
             _durationMs = durationMs;
           }
@@ -336,9 +347,10 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
         color: Colors.white70,
       );
     }
-    final String screenDetail = _screenWidth > 0 && _screenHeight > 0
-        ? '外接屏 $_screenWidth×$_screenHeight'
-        : '外接屏已连接';
+    final String screenDetail = (_screenWidth > 0 && _screenHeight > 0
+            ? '外接屏 $_screenWidth×$_screenHeight'
+            : '外接屏已连接') +
+        (_windowVisible ? '' : ' · 尚未显示${_sceneState == null ? '' : '（$_sceneState）'}');
     if (_playing) {
       return _StatusInfo(
         icon: Icons.play_circle_outline_rounded,
