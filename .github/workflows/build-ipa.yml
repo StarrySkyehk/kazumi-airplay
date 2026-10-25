@@ -1,0 +1,133 @@
+name: ios-ipa
+
+# Builds an unsigned iOS IPA for Kazumi + the AR-glasses (external display) patch.
+# Strategy: clone upstream at a pinned commit, overlay the files from ./overlay,
+# then run the same steps as upstream's release workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'macOS runner image'
+        required: true
+        default: 'macos-26'
+        type: choice
+        options:
+          - macos-26
+          - xcode-27
+          - macos-latest
+      label:
+        description: 'artifact label suffix'
+        required: false
+        default: 'canary'
+      analyze_only:
+        description: 'only run flutter analyze (fast, no IPA)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM_REPO: https://github.com/Predidit/Kazumi.git
+  UPSTREAM_SHA: 55e317e5f0c346d4318327ae0e5614eb8ee9097f
+  DANDANAPI_APPID: ${{ secrets.DANDANAPI_APPID }}
+  DANDANAPI_KEY: ${{ secrets.DANDANAPI_KEY }}
+  KAZUMI_APPID: ${{ secrets.KAZUMI_APPID }}
+  KAZUMI_KEY: ${{ secrets.KAZUMI_KEY }}
+
+jobs:
+  build-ios:
+    name: "Build unsigned iOS IPA"
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    steps:
+      - name: Checkout patch repo
+        uses: actions/checkout@v4
+
+      - name: Clone upstream (pinned)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "$UPSTREAM_REPO" app
+          cd app
+          git fetch --depth 1 origin "$UPSTREAM_SHA"
+          git checkout -q FETCH_HEAD
+          git log --oneline -1
+
+      - name: Apply overlay
+        run: |
+          set -euo pipefail
+          if [ -d overlay ]; then
+            cd overlay
+            find . -type f -print0 | while IFS= read -r -d '' f; do
+              rel="${f#./}"
+              mkdir -p "../app/$(dirname "$rel")"
+              cp "$f" "../app/$rel"
+              echo "overlaid $rel"
+            done
+          else
+            echo "no overlay directory, building pristine upstream"
+          fi
+
+      - name: Show Xcode
+        run: |
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2.16.0
+        with:
+          channel: stable
+          flutter-version-file: app/pubspec.yaml
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Get Flutter dependencies
+        working-directory: app
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: app
+        run: flutter analyze --no-fatal-infos --fatal-warnings
+
+      - name: Install native build tools
+        if: ${{ !inputs.analyze_only }}
+        run: brew install cmake ninja
+
+      - name: Build iOS (no codesign)
+        if: ${{ !inputs.analyze_only }}
+        working-directory: app
+        run: >-
+          flutter build ios --release --no-codesign
+          --dart-define=DANDANAPI_APPID="$DANDANAPI_APPID"
+          --dart-define=DANDANAPI_KEY="$DANDANAPI_KEY"
+          --dart-define=KAZUMI_APPID="$KAZUMI_APPID"
+          --dart-define=KAZUMI_KEY="$KAZUMI_KEY"
+
+      - name: Package unsigned IPA
+        if: ${{ !inputs.analyze_only }}
+        working-directory: app
+        env:
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -euo pipefail
+          mkdir -p Payload
+          cp -R build/ios/iphoneos/Runner.app Payload/Runner.app
+          if [ -d Payload/Runner.app/Frameworks ]; then
+            find Payload/Runner.app/Frameworks -type d -name "*.framework" \
+              -exec codesign --force --sign - --preserve-metadata=identifier,entitlements {} \;
+          fi
+          OUT="Kazumi_ios_${LABEL}_no_sign.ipa"
+          zip -q -r "$OUT" Payload
+          ls -lh "$OUT"
+
+      - name: Upload IPA
+        if: ${{ !inputs.analyze_only }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios_outputs_${{ inputs.label }}
+          path: app/Kazumi_ios_*_no_sign.ipa
+          if-no-files-found: error
