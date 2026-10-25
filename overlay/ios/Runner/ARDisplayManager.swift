@@ -538,9 +538,11 @@ final class ARDisplayManager: NSObject {
             sessionRole: .windowExternalDisplayNonInteractive
         )
         configuration.delegateClass = ARDisplaySceneDelegate.self
+        // Use the variant without `userInfo`: the `userInfo:` overload takes a
+        // non-optional `Any` (verified by the Xcode 27 SDK build), and we do not
+        // need to pass extra context to the scene delegate.
         let accessory = UISceneAccessory.externalNonInteractive(
-            sceneConfiguration: configuration,
-            userInfo: nil
+            sceneConfiguration: configuration
         )
         let registration = hostViewController.registerSceneAccessory(accessory)
         registeredAccessory = registration
