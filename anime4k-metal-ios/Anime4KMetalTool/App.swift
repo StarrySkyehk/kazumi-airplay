@@ -9,6 +9,7 @@ import AVFoundation
 import Photos
 import PhotosUI
 import SwiftUI
+import UIKit
 
 @main
 struct Anime4KMetalToolApp: App {
@@ -99,6 +100,7 @@ final class JobModel: ObservableObject {
         phase = .processing
         statusText = "处理中…（首次会先编译着色器，约几秒）"
         startedAt = Date()
+        UIApplication.shared.isIdleTimerDisabled = true
 
         Task.detached(priority: .userInitiated) { [weak self] in
             do {
@@ -121,6 +123,7 @@ final class JobModel: ObservableObject {
                     guard let self = self else { return }
                     if let error = error as? TranscodeError,
                        case .cancelled = error {
+                        UIApplication.shared.isIdleTimerDisabled = false
                         self.phase = .ready
                         self.statusText = "已取消，可以重新开始"
                         self.progress = 0
@@ -128,6 +131,7 @@ final class JobModel: ObservableObject {
                         self.etaText = ""
                         return
                     }
+                    UIApplication.shared.isIdleTimerDisabled = false
                     self.phase = .failed
                     self.statusText = "处理失败"
                     self.errorText = error.localizedDescription
@@ -166,6 +170,7 @@ final class JobModel: ObservableObject {
     }
 
     private func finish(with result: TranscodeResult) {
+        UIApplication.shared.isIdleTimerDisabled = false
         progress = 1
         phase = .finished
         outputURL = result.outputURL
@@ -435,7 +440,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("实现说明")
                 .font(.footnote.bold())
-            Text("Anime4K 着色器在 iOS 上无法直接当 GLSL 用，这里用 Anime4KMetal（Apache-2.0）把官方 GLSL 动态翻译成 Metal 在 GPU 上跑，再逐帧编码成 H.264 mp4。全程本地处理，不联网。处理速度取决于机型：模式 A（Fast）在 A15 及以上通常比实时快，HQ 档会明显慢。")
+            Text("着色器链：bloc97/Anime4K v4 官方 GLSL，经 Anime4KMetal（Apache-2.0）动态翻译成 Metal，在 GPU 上逐帧执行后由 AVAssetWriter 编码成 H.264 mp4。全程本地处理、不联网。\n\n处理期间请保持 App 在前台（我已自动禁止锁屏，但切走 App 会暂停）。速度取决于机型：模式 A（Fast）在 A15 及以上通常不慢于实时，HQ 档明显更慢。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
