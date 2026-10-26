@@ -256,6 +256,12 @@ private final class ARDanmakuLabel: UILabel {
 
     let textInsets: UIEdgeInsets
 
+    /// Outline width as a positive `NSAttributedString` stroke percentage. Positive values
+    /// mean "stroke only", which is drawn first and then covered by the solid fill so the
+    /// outline sits *outside* the glyph instead of eating into the fill (that was the
+    /// "hollow text" artifact on the glasses).
+    var strokePercent: Double = 0
+
     init(insets: UIEdgeInsets) {
         self.textInsets = insets
         super.init(frame: .zero)
@@ -277,7 +283,23 @@ private final class ARDanmakuLabel: UILabel {
     }
 
     override func drawText(in rect: CGRect) {
-        super.drawText(in: rect.inset(by: textInsets))
+        let target = rect.inset(by: textInsets)
+        guard let attributed = attributedText else {
+            super.drawText(in: rect)
+            return
+        }
+        if strokePercent > 0 {
+            let stroked = NSMutableAttributedString(attributedString: attributed)
+            let fullRange = NSRange(location: 0, length: stroked.length)
+            stroked.addAttribute(.strokeColor, value: UIColor.black, range: fullRange)
+            stroked.addAttribute(
+                .strokeWidth,
+                value: NSNumber(value: strokePercent),
+                range: fullRange
+            )
+            stroked.draw(in: target)
+        }
+        attributed.draw(in: target)
     }
 
     override var intrinsicContentSize: CGSize {
@@ -862,6 +884,11 @@ final class ARDanmakuOverlayView: UIView {
 
     private func updateActiveDanmakus(atMilliseconds nowMilliseconds: Double, scale: CGFloat) {
         guard !activeDanmakus.isEmpty else { return }
+        // Per-frame moves must not run implicit CoreAnimation animations, otherwise a fast
+        // scrolling label leaves a ghost/trail behind it.
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
         let width = bounds.width
         let durationMs = scrollDurationMilliseconds
         var index = 0
@@ -901,13 +928,21 @@ final class ARDanmakuOverlayView: UIView {
         pointSize: CGFloat,
         scale: CGFloat
     ) -> ARDanmakuLabel {
-        // Room for the outline: half the stroke plus a hair of anti-aliasing margin.
-        let inset = max(Layout.minimumTextInset, configuration.strokeWidth * 0.5 + 1.0)
+        // Room for the outline: with the two-pass draw the outline extends a full
+        // `strokeWidth` outside the glyph, plus a hair of anti-aliasing margin.
+        let inset = max(Layout.minimumTextInset, configuration.strokeWidth + 2.0)
         let insets = UIEdgeInsets(top: inset, left: inset, bottom: inset, right: inset)
         let label = ARDanmakuLabel(insets: insets)
         let font = ARDanmakuOverlayView.font(forWeight: configuration.fontWeight, size: pointSize)
         label.font = font
-        label.attributedText = makeAttributedText(for: item, font: font, fontSize: pointSize)
+        label.attributedText = makeAttributedText(for: item, font: font)
+        if configuration.strokeWidth > 0, pointSize > 0 {
+            // Positive percentage = stroke-only outline; 2x the desired outward width because
+            // half of a centred stroke is covered by the fill pass.
+            label.strokePercent = Double(configuration.strokeWidth / pointSize) * 200.0
+        } else {
+            label.strokePercent = 0
+        }
         let labelSize = label.sizeForText()
         label.frame = CGRect(origin: .zero, size: labelSize)
         label.alpha = 1.0
@@ -921,22 +956,13 @@ final class ARDanmakuOverlayView: UIView {
 
     private func makeAttributedText(
         for item: ARDanmakuItem,
-        font: UIFont,
-        fontSize: CGFloat
+        font: UIFont
     ) -> NSAttributedString {
-        var attributes: [NSAttributedString.Key: Any] = [
+        // Fill only: the outline is drawn as a separate stroke-only pass in ARDanmakuLabel.
+        let attributes: [NSAttributedString.Key: Any] = [
             .font: font,
             .foregroundColor: item.color,
         ]
-        let strokeWidth = configuration.strokeWidth
-        if strokeWidth > 0, fontSize > 0 {
-            attributes[.strokeColor] = UIColor.black
-            // NSAttributedString stroke width is a percentage of the font size and a
-            // negative value means "fill + stroke" (outline around the glyphs).
-            attributes[.strokeWidth] = NSNumber(
-                value: Double(-(strokeWidth / fontSize) * 100.0)
-            )
-        }
         return NSAttributedString(string: item.text, attributes: attributes)
     }
 

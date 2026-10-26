@@ -436,13 +436,29 @@ class PlayerController implements Disposable {
 
   Future<void> _releasePlaybackResources() async {
     hideVolumeUITimer?.cancel();
+    hideVolumeUITimer = null;
     _volumeGestureSyncTimer?.cancel();
     FlutterVolumeController.removeListener();
-    await Future.wait([
-      audioController.deactivate(),
-      playback.stop(),
-      _restoreSystemVolumeUi(),
-    ]);
+    // Release step by step with a hard timeout each: a single stuck platform call used to
+    // leave the player page at "加载中" forever (e.g. after ending an AR projection).
+    await _releaseStep('audio.deactivate', audioController.deactivate());
+    await _releaseStep('playback.stop', playback.stop());
+    await _releaseStep('restoreVolumeUi', _restoreSystemVolumeUi());
+  }
+
+  Future<void> _releaseStep(String name, Future<void> future) async {
+    try {
+      await future.timeout(const Duration(seconds: 6));
+      KazumiLogger().i('PlayerController: release step $name done');
+    } on TimeoutException {
+      KazumiLogger().e('PlayerController: release step $name timed out (6s)');
+    } catch (error, stackTrace) {
+      KazumiLogger().w(
+        'PlayerController: release step $name failed',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
   }
 
   Future<void> _restoreSystemVolumeUi() async {
@@ -525,25 +541,30 @@ class PlayerController implements Disposable {
       }
     }
     final double previousSpeed = playback.playerSpeed;
+    KazumiLogger().i('PlayerController: rebuilding playback after AR');
     final bool initialized = await init(
       params.copyWithOffset((safePositionMs / 1000).round()),
     ).timeout(
-      const Duration(seconds: 25),
+      const Duration(seconds: 12),
       onTimeout: () {
-        KazumiLogger().e('PlayerController: rebuild after AR timed out (25s)');
+        KazumiLogger().e('PlayerController: rebuild after AR timed out (12s)');
         return false;
       },
     );
     if (!initialized) {
+      KazumiLogger().e('PlayerController: rebuild after AR failed');
+      playback.loading = false;
       _showArResumeFailureToast();
       return false;
     }
+    KazumiLogger().i('PlayerController: rebuild after AR done');
     // init() 会把倍速重置为设置里的默认值，这里恢复用户退出前的倍速。
     if (previousSpeed > 0 && previousSpeed != playback.playerSpeed) {
       await setPlaybackSpeed(previousSpeed);
     }
     final Player? player = playback.mediaPlayer;
     if (player == null) {
+      playback.loading = false;
       _showArResumeFailureToast();
       return false;
     }

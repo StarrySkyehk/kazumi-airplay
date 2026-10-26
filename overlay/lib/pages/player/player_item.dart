@@ -107,6 +107,9 @@ class _PlayerItemState extends State<PlayerItem>
   bool _arDisplayInProgress = false;
   bool _arConnectingDialogVisible = false;
   bool _arConnectingCancelled = false;
+  bool _arCancelResumeStarted = false;
+  int _arStartPositionMs = 0;
+  bool _arResumePlayback = false;
   Future<void>? _arReleaseFuture;
 
   late double _danmakuArea;
@@ -1230,8 +1233,14 @@ class _PlayerItemState extends State<PlayerItem>
             actions: <Widget>[
               TextButton(
                 onPressed: () {
+                  KazumiLogger().i('AR: cancel tapped');
                   _arConnectingCancelled = true;
                   _hideArConnectingDialog();
+                  KazumiDialog.showToast(message: '已取消投屏，正在恢复播放…');
+                  if (!_arCancelResumeStarted) {
+                    _arCancelResumeStarted = true;
+                    unawaited(_cancelArHandoff());
+                  }
                 },
                 child: const Text('取消'),
               ),
@@ -1258,7 +1267,9 @@ class _PlayerItemState extends State<PlayerItem>
     if (!Platform.isIOS) {
       return;
     }
-    if (playerController.playback.mediaPlayer == null) {
+    // 投屏只需要 URL/headers/位置，不依赖手机端 mpv 是否已经重新加载完成：
+    // 结束上一次投屏后立刻再次投屏、或恢复播放仍在缓冲时，都应该能直接投。
+    if (playerController.videoUrl.isEmpty) {
       KazumiDialog.showToast(message: '视频尚未加载完成，请稍后再试');
       return;
     }
@@ -1266,11 +1277,14 @@ class _PlayerItemState extends State<PlayerItem>
       return;
     }
     _arDisplayInProgress = true;
+    _arCancelResumeStarted = false;
     final int startPositionMs =
         playerController.playback.playerPosition.inMilliseconds;
+    _arStartPositionMs = startPositionMs;
     // 释放后 playback.duration 会归零，投屏页的时长必须提前取。
     final int durationMs = playerController.playback.duration.inMilliseconds;
     final bool resumePlayback = playerController.playback.playing;
+    _arResumePlayback = resumePlayback;
     final bool superResolutionActive =
         playerController.playback.superResolutionMode !=
             SuperResolutionMode.off;
@@ -1290,10 +1304,12 @@ class _PlayerItemState extends State<PlayerItem>
       await _arPauseForHandoff();
       if (_arConnectingCancelled) {
         KazumiLogger().i('AR: cancelled before native start');
-        await _resumeAfterArDisplay(
-          positionMs: startPositionMs,
-          resumePlayback: resumePlayback,
-        );
+        if (!_arCancelResumeStarted) {
+          await _resumeAfterArDisplay(
+            positionMs: startPositionMs,
+            resumePlayback: resumePlayback,
+          );
+        }
         return;
       }
       KazumiLogger().i('AR: releasing mobile playback in background');
@@ -1321,10 +1337,12 @@ class _PlayerItemState extends State<PlayerItem>
       if (_arConnectingCancelled) {
         KazumiLogger().i('AR: cancelled after native start');
         await ARDisplayService.stop();
-        await _resumeAfterArDisplay(
-          positionMs: startPositionMs,
-          resumePlayback: resumePlayback,
-        );
+        if (!_arCancelResumeStarted) {
+          await _resumeAfterArDisplay(
+            positionMs: startPositionMs,
+            resumePlayback: resumePlayback,
+          );
+        }
         return;
       }
       if (!startResult.ok) {
@@ -1389,8 +1407,27 @@ class _PlayerItemState extends State<PlayerItem>
     } finally {
       _hideArConnectingDialog();
       _arDisplayInProgress = false;
+      _arCancelResumeStarted = false;
       KazumiLogger().i('AR: handoff flow finished');
     }
+  }
+
+  /// 「取消」按下后立刻做的事：停掉（可能刚起来的）原生播放并恢复手机播放，
+  /// 不再等挂起的 native start 超时。
+  Future<void> _cancelArHandoff() async {
+    KazumiLogger().i('AR: cancel -> stopping native and restoring playback');
+    try {
+      await ARDisplayService.stop();
+    } catch (error, stackTrace) {
+      KazumiLogger().w('AR: stop during cancel failed', error: error, stackTrace: stackTrace);
+    }
+    if (!mounted) {
+      return;
+    }
+    await _resumeAfterArDisplay(
+      positionMs: _arStartPositionMs,
+      resumePlayback: _arResumePlayback,
+    );
   }
 
   Future<void> _arPauseForHandoff() async {
