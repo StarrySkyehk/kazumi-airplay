@@ -36,6 +36,8 @@ class Anime4K {
     var pipelineStates: [MTLComputePipelineState]
     var finalResizePS: MTLComputePipelineState!
     var textureMap: [[String : MTLTexture]]
+    /// key = "<name>_<w>x<h>"；跨帧复用中间纹理，避免每帧重复创建大纹理（显著减少分配开销）。
+    var texturePool: [String: MTLTexture] = [:]
     var nearestSamplerStates: [MTLSamplerState]
     var linearSamplerStates: [MTLSamplerState]
     var sizeMap: [String: (Float, Float)]
@@ -84,6 +86,7 @@ class Anime4K {
         linearSamplerStates.removeAll()
         pipelineStates.removeAll()
         textureMap.removeAll()
+        texturePool.removeAll()
         sizeMap.removeAll()
         bufferIndex = -1
         self.textureInW = Float(textureInW)
@@ -172,6 +175,31 @@ class Anime4K {
         finalResizePS = try device.makeComputePipelineState(function: defaultLibrary.makeFunction(name: "CenterResize")!)
     }
     
+    private func pooledTexture(
+        _ device: MTLDevice,
+        name: String,
+        width: Int,
+        height: Int
+    ) -> MTLTexture? {
+        let key = "\(name)_\(width)x\(height)"
+        if let existing = texturePool[key],
+           existing.width == width,
+           existing.height == height {
+            return existing
+        }
+        let desc = MTLTextureDescriptor()
+        desc.width = width
+        desc.height = height
+        desc.pixelFormat = .rgba16Float
+        desc.usage = [.shaderWrite, .shaderRead]
+        desc.storageMode = .private
+        guard let texture = device.makeTexture(descriptor: desc) else {
+            return nil
+        }
+        texturePool[key] = texture
+        return texture
+    }
+
     func encode(_ device: MTLDevice, cmdBuf: MTLCommandBuffer, input: MTLTexture) throws -> MTLTexture {
         guard pipelineStates.count == enabledShaders.count else {
             throw Anime4KError.encoderFail("Pipeline state count \(pipelineStates.count) mismatch shader count \(shaders.count)")
@@ -198,13 +226,12 @@ class Anime4K {
         textureMap[bufferIndex]["MAIN"] = input
         textureMap[bufferIndex]["NATIVE"] = input
         
-        let desc = MTLTextureDescriptor()
-        desc.width = Int(outputW)
-        desc.height = Int(outputH)
-        desc.pixelFormat = .rgba16Float
-        desc.usage = [.shaderWrite, .shaderRead]
-        desc.storageMode = .private
-        textureMap[bufferIndex]["output"] = device.makeTexture(descriptor: desc)
+        textureMap[bufferIndex]["output"] = pooledTexture(
+            device,
+            name: "output",
+            width: Int(outputW),
+            height: Int(outputH)
+        )
         
         for i in 0..<enabledShaders.count {
             let shader = enabledShaders[i]
@@ -236,13 +263,12 @@ class Anime4K {
                 }
                 if !textureMap[bufferIndex].keys.contains(textureName) {
                     if textureName == shader.save {
-                        let desc = MTLTextureDescriptor()
-                        desc.width = Int(outputW)
-                        desc.height = Int(outputH)
-                        desc.pixelFormat = .rgba16Float
-                        desc.usage = [.shaderWrite, .shaderRead]
-                        desc.storageMode = .private
-                        textureMap[bufferIndex][textureName] = device.makeTexture(descriptor: desc)
+                        textureMap[bufferIndex][textureName] = pooledTexture(
+                            device,
+                            name: textureName,
+                            width: Int(outputW),
+                            height: Int(outputH)
+                        )
                     } else {
                         throw Anime4KError.encoderFail("texture \(textureName) is missing")
                     }
@@ -250,13 +276,12 @@ class Anime4K {
                 encoder.setTexture(textureMap[bufferIndex][textureName], index: j)
             }
             if shader.binds.contains(shader.outputTextureName) || !textureMap[bufferIndex].keys.contains(shader.outputTextureName) {
-                let desc = MTLTextureDescriptor()
-                desc.width = Int(outputW)
-                desc.height = Int(outputH)
-                desc.pixelFormat = .rgba16Float
-                desc.usage = [.shaderWrite, .shaderRead]
-                desc.storageMode = .private
-                textureMap[bufferIndex][shader.outputTextureName] = device.makeTexture(descriptor: desc)
+                textureMap[bufferIndex][shader.outputTextureName] = pooledTexture(
+                    device,
+                    name: shader.outputTextureName,
+                    width: Int(outputW),
+                    height: Int(outputH)
+                )
             }
             let outputTex = textureMap[bufferIndex][shader.outputTextureName]!
             encoder.setTexture(outputTex, index: shader.inputTextureNames.count)

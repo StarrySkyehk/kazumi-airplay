@@ -256,6 +256,7 @@ final class OfflineTranscoder {
     func transcode(
         settings: TranscodeSettings,
         to outputURL: URL,
+        onStage: @escaping @Sendable (String) -> Void,
         progress: @escaping @Sendable (Double, Double) -> Void
     ) async throws -> TranscodeResult {
         let display = displayedSize()
@@ -267,6 +268,7 @@ final class OfflineTranscoder {
         let canvasHeight = evenPixels(naturalSize.height * scale)
 
         let preset = Self.presets.first { $0.key == settings.presetKey } ?? Self.presets[0]
+        onStage("正在编译 Anime4K 着色器（首次约几秒）…")
         var engines: [Anime4K] = []
         var currentWidth = max(2, Int(naturalSize.width))
         var currentHeight = max(2, Int(naturalSize.height))
@@ -293,7 +295,6 @@ final class OfflineTranscoder {
             currentWidth = Int(engine.outputW)
             currentHeight = Int(engine.outputH)
             engines.append(engine)
-            progress(0.01, 0)
         }
         guard let last = engines.last,
               last.outputW >= 2, last.outputH >= 2,
@@ -310,6 +311,7 @@ final class OfflineTranscoder {
         try? fileManager.removeItem(at: tempVideoURL)
         try? fileManager.removeItem(at: outputURL)
 
+        onStage("开始转码…")
         try await encodeVideo(
             to: tempVideoURL,
             engines: engines,
@@ -444,6 +446,9 @@ final class OfflineTranscoder {
         var failure: Error?
         var finished = false
         let totalSeconds = max(0.01, duration.seconds)
+        var windowStart = CACurrentMediaTime()
+        var windowFrames = 0
+        var currentFPS: Double = 0
 
         input.requestMediaDataWhenReady(on: DispatchQueue(label: "anime4k.feed")) {
             if finished { return }
@@ -481,8 +486,16 @@ final class OfflineTranscoder {
                         shouldStop = true
                         return
                     }
+                    windowFrames += 1
+                    let nowTime = CACurrentMediaTime()
+                    let windowElapsed = nowTime - windowStart
+                    if windowElapsed >= 0.75 {
+                        currentFPS = Double(windowFrames) / windowElapsed
+                        windowFrames = 0
+                        windowStart = nowTime
+                    }
                     let seconds = max(0, CMTimeGetSeconds(pts))
-                    progress(min(1.0, seconds / totalSeconds), 0)
+                    progress(min(1.0, seconds / totalSeconds), currentFPS)
                 }
             }
 

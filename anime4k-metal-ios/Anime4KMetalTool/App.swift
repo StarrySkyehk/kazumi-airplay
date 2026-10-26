@@ -39,6 +39,7 @@ final class JobModel: ObservableObject {
     @Published var statusText = "从相册或文件里选一个视频"
     @Published var progress: Double = 0
     @Published var speedText = ""
+    @Published var fpsText = ""
     @Published var etaText = ""
     @Published var errorText: String?
     @Published var outputURL: URL?
@@ -51,6 +52,9 @@ final class JobModel: ObservableObject {
     private var transcoder: OfflineTranscoder?
     private var sourceDuration: Double = 0
     private var startedAt: Date?
+    private var lastPercent: Double = 0
+    private var lastSampleTime: Date?
+    private var smoothedSpeed: Double = 0
 
     var isProcessing: Bool {
         phase == .processing
@@ -92,25 +96,45 @@ final class JobModel: ObservableObject {
             .appendingPathComponent("anime4k_out_\(UUID().uuidString).mp4")
         progress = 0
         speedText = ""
+        fpsText = ""
         etaText = ""
         errorText = nil
         savedToPhotos = false
         outputURL = nil
         outputInfo = ""
         phase = .processing
-        statusText = "处理中…（首次会先编译着色器，约几秒）"
-        startedAt = Date()
+        statusText = "正在准备…"
+        startedAt = nil
+        lastPercent = 0
+        lastSampleTime = nil
+        smoothedSpeed = 0
         UIApplication.shared.isIdleTimerDisabled = true
 
         Task.detached(priority: .userInitiated) { [weak self] in
             do {
                 let result = try await transcoder.transcode(
                     settings: settings,
-                    to: output
-                ) { percent, _ in
+                    to: output,
+                    onStage: { stage in
+                        Task { @MainActor [weak self] in
+                            guard let self = self else { return }
+                            self.statusText = stage
+                            if stage.hasPrefix("开始转码") {
+                                // 从这里开始计时，编译着色器的时间不算进速度。
+                                self.startedAt = Date()
+                                self.lastSampleTime = Date()
+                                self.lastPercent = 0
+                                self.smoothedSpeed = 0
+                            }
+                        }
+                    }
+                ) { percent, fps in
                     Task { @MainActor [weak self] in
                         guard let self = self else { return }
                         self.progress = percent
+                        if fps > 0 {
+                            self.fpsText = String(format: "%.0f fps", fps)
+                        }
                         self.updateSpeed(percent: percent)
                     }
                 }
@@ -128,6 +152,7 @@ final class JobModel: ObservableObject {
                         self.statusText = "已取消，可以重新开始"
                         self.progress = 0
                         self.speedText = ""
+                        self.fpsText = ""
                         self.etaText = ""
                         return
                     }
@@ -176,6 +201,7 @@ final class JobModel: ObservableObject {
         outputURL = result.outputURL
         statusText = "完成，可以保存到相册或分享"
         speedText = ""
+        fpsText = ""
         etaText = ""
         let attributes = try? FileManager.default.attributesOfItem(atPath: result.outputURL.path)
         let bytes = (attributes?[.size] as? Int64) ?? 0
@@ -193,11 +219,25 @@ final class JobModel: ObservableObject {
     }
 
     private func updateSpeed(percent: Double) {
-        guard let startedAt = startedAt, percent > 0.01 else { return }
-        let elapsed = max(0.1, Date().timeIntervalSince(startedAt))
-        let processed = sourceDuration * percent
-        let speed = processed / elapsed
-        speedText = String(format: "%.2fx 实时", speed)
+        let now = Date()
+        guard let lastTime = lastSampleTime else {
+            lastSampleTime = now
+            lastPercent = percent
+            return
+        }
+        let deltaTime = now.timeIntervalSince(lastTime)
+        let deltaPercent = percent - lastPercent
+        guard deltaTime > 0.2 else { return }
+        lastSampleTime = now
+        lastPercent = percent
+        guard deltaPercent > 0.0001 else { return }
+        // 瞬时速度：这段时间实际处理掉的视频秒数 / 真实耗时
+        let instantSpeed = (sourceDuration * deltaPercent) / deltaTime
+        smoothedSpeed = smoothedSpeed > 0
+            ? smoothedSpeed * 0.65 + instantSpeed * 0.35
+            : instantSpeed
+        speedText = String(format: "%.2fx 实时", smoothedSpeed)
+        let speed = smoothedSpeed
         if speed > 0.001 {
             let remaining = (sourceDuration - processed) / speed
             if remaining > 1 {
@@ -368,9 +408,14 @@ struct ContentView: View {
                         Text(String(format: "%.0f%%", job.progress * 100))
                             .font(.system(.title3, design: .rounded).bold())
                         Spacer()
-                        Text(job.speedText)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text(job.speedText)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(job.fpsText)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
                     }
                     if !job.etaText.isEmpty {
                         Text(job.etaText)

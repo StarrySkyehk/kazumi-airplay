@@ -120,9 +120,15 @@ if mode == "smoke" {
                 let (transcoder, info) = try await OfflineTranscoder.prepare(inputURL: inputURL)
                 note("input: " + info)
                 let settings = TranscodeSettings(presetKey: "modeAFast", targetHeight: 720)
-                let result = try await transcoder.transcode(settings: settings, to: outputURL) { percent, _ in
-                    if percent >= 1.0 { note("progress 100%") }
-                }
+                let result = try await transcoder.transcode(
+                    settings: settings,
+                    to: outputURL,
+                    onStage: { stage in note("stage: " + stage) },
+                    progress: { percent, fps in
+                        if percent >= 1.0 { note("progress 100%") }
+                        if fps > 0 { note(String(format: "fps %.1f", fps)) }
+                    }
+                )
                 resultURL = result.outputURL
                 resultSize = CGSize(width: result.width, height: result.height)
             } catch {
