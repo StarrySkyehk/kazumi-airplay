@@ -111,7 +111,7 @@ final class ARDisplayPlayerViewController: UIViewController {
             width: width,
             height: screenHeight
         )
-        let scale = window?.screen.scale ?? UIScreen.main.scale
+        let scale = view.window?.screen.scale ?? UIScreen.main.scale
         let pixelWidth = Int((view.bounds.width * scale).rounded())
         let pixelHeight = Int((view.bounds.height * scale).rounded())
         idleScreenLabel.text = "外接屏 \(pixelWidth)×\(pixelHeight) · 等待播放"
