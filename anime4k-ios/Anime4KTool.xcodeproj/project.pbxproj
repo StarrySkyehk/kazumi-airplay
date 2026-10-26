@@ -56,8 +56,7 @@
 		D10000000000000000000003 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				C10000000000000000000006 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		C10000000000000000000005 /* Anime4KTool.app */,
+				C10000000000000000000005 /* Anime4KTool.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
