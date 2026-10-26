@@ -202,6 +202,18 @@ final class ARDisplayPlayerViewController: UIViewController {
         upscaler = renderer
         renderer.start()
         NSLog("[Kazumi][ARDisplay] super resolution enabled (quality=%@)", quality ? "1" : "0")
+        // Watchdog: if the Metal path renders nothing within 2s (unsupported device, driver
+        // issue, zero-size layer), fall back to the plain AVPlayerLayer instead of a black
+        // screen. The state event reports `upscalerActive=false` afterwards.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self, weak renderer] in
+            guard let self = self, let renderer = renderer, self.upscaler === renderer else {
+                return
+            }
+            if !renderer.hasRenderedFrame {
+                NSLog("[Kazumi][ARDisplay] super resolution produced no frame, falling back")
+                self.removeSuperResolutionRenderer()
+            }
+        }
     }
 
     func removeSuperResolutionRenderer() {
@@ -248,6 +260,10 @@ final class ARVideoUpscalerRenderer {
     private var displayLinkProxy: ARUpscalerDisplayLinkProxy?
     private var lastImage: CIImage?
     private var isRunning = false
+
+    /// Set once the first frame has been presented; the controller watchdog falls back to the
+    /// plain AVPlayerLayer if the Metal path never produces a frame.
+    private(set) var hasRenderedFrame = false
 
     init?(player: AVPlayer, item: AVPlayerItem, quality: Bool) {
         guard let device = MTLCreateSystemDefaultDevice(),
@@ -390,6 +406,10 @@ final class ARVideoUpscalerRenderer {
         )
         commandBuffer.present(drawable)
         commandBuffer.commit()
+        if !hasRenderedFrame {
+            hasRenderedFrame = true
+            NSLog("[Kazumi][ARDisplay] super resolution first frame rendered")
+        }
     }
 }
 
