@@ -574,7 +574,7 @@ final class ARDisplayManager: NSObject {
                 guard !self.isDisplayConnected,
                       let registration = self.registeredAccessory
                 else { return }
-                logStep("pre-registration kick: scene not connected (enabled=\(registration.isEnabled))")
+                self.logStep("pre-registration kick: scene not connected (enabled=\(registration.isEnabled))")
                 self.kickAccessoryPresentation()
             }
         }
