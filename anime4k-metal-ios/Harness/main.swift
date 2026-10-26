@@ -255,6 +255,9 @@ func makeTestMovie(
         guard let buffer = pixelBuffer else {
             throw NSError(domain: "harness", code: 4)
         }
+        while !input.isReadyForMoreMediaData {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
         let t = CGFloat(index) / CGFloat(max(1, frames))
         let background = CIImage(color: CIColor(red: 0.08, green: 0.10, blue: 0.16))
             .cropped(to: CGRect(x: 0, y: 0, width: w, height: h))
