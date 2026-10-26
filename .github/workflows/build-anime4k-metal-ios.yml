@@ -1,0 +1,71 @@
+name: anime4k-metal-ios-ipa
+
+# Builds the iOS "Anime4K 超分" app (real Anime4K GLSL shaders translated to Metal)
+# as an unsigned IPA for sideloading.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'macOS runner image'
+        required: true
+        default: 'macos-26'
+        type: choice
+        options:
+          - macos-26
+          - macos-latest
+          - xcode-27
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "Build Anime4KMetalTool unsigned IPA"
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode
+        run: |
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Build app (no codesign)
+        run: |
+          set -euo pipefail
+          cd anime4k-metal-ios
+          xcodebuild \
+            -project Anime4KMetalTool.xcodeproj \
+            -scheme Anime4KMetalTool \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            ONLY_ACTIVE_ARCH=NO \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="anime4k-metal-ios/build/Build/Products/Release-iphoneos/Anime4KMetalTool.app"
+          test -d "$APP"
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$APP" Payload/Anime4KMetalTool.app
+          codesign --force --sign - --timestamp=none Payload/Anime4KMetalTool.app/Anime4KMetalTool || true
+          OUT="Anime4KMetalTool_ios_no_sign.ipa"
+          zip -q -r "$OUT" Payload
+          ls -lh "$OUT"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: anime4k_metal_ios_ipa
+          path: Anime4KMetalTool_ios_no_sign.ipa
+          if-no-files-found: error
