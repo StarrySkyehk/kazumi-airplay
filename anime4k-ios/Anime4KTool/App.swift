@@ -175,6 +175,9 @@ final class JobModel: ObservableObject {
         if bytes > 0 {
             info += " · " + ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
         }
+        if result.audioMuxFailed {
+            info += "\n（音轨合并失败：输出为无声视频）"
+        }
         outputInfo = info
     }
 

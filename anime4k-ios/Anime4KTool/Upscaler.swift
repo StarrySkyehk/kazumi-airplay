@@ -28,6 +28,8 @@ struct UpscaleResult {
     let width: Int
     let height: Int
     let duration: Double
+    /// 音轨合并失败、输出为无声视频时为 true。
+    let audioMuxFailed: Bool
 }
 
 enum UpscaleError: LocalizedError {
@@ -151,8 +153,10 @@ final class VideoUpscaler {
         progress: @escaping @Sendable (Double, Double) -> Void
     ) async throws -> UpscaleResult {
         let display = displayedSize()
+        // 以「短边」对齐目标分辨率：横屏 720p→1080p 放大，竖屏 1080p 保持原样而不是被缩小。
+        let shortSide = max(1, min(display.width, display.height))
         let scale: CGFloat = settings.targetHeight > 0
-            ? CGFloat(settings.targetHeight) / max(1, display.height)
+            ? CGFloat(settings.targetHeight) / shortSide
             : 1.0
 
         var renderWidth = evenPixels(naturalSize.width * scale)
@@ -178,12 +182,14 @@ final class VideoUpscaler {
             progress: progress
         )
 
+        var audioMuxFailed = false
         if let _ = audioTrack {
             do {
                 try await mux(videoURL: tempVideoURL, outputURL: outputURL)
                 try? fileManager.removeItem(at: tempVideoURL)
             } catch {
                 // 音轨合并失败时保底：直接使用无声视频，避免整次处理白做。
+                audioMuxFailed = true
                 try? fileManager.removeItem(at: outputURL)
                 try fileManager.moveItem(at: tempVideoURL, to: outputURL)
             }
@@ -196,7 +202,8 @@ final class VideoUpscaler {
             outputURL: outputURL,
             width: renderWidth,
             height: renderHeight,
-            duration: max(0, duration.seconds)
+            duration: max(0, duration.seconds),
+            audioMuxFailed: audioMuxFailed
         )
     }
 
