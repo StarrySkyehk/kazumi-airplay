@@ -6,6 +6,7 @@
 //
 
 import AVFoundation
+import Darwin
 import Photos
 import PhotosUI
 import SwiftUI
@@ -40,6 +41,7 @@ final class JobModel: ObservableObject {
     @Published var progress: Double = 0
     @Published var speedText = ""
     @Published var fpsText = ""
+    @Published var memoryText = ""
     @Published var etaText = ""
     @Published var errorText: String?
     @Published var outputURL: URL?
@@ -55,6 +57,7 @@ final class JobModel: ObservableObject {
     private var lastPercent: Double = 0
     private var lastSampleTime: Date?
     private var smoothedSpeed: Double = 0
+    private var memoryTimer: Timer?
 
     var isProcessing: Bool {
         phase == .processing
@@ -109,6 +112,7 @@ final class JobModel: ObservableObject {
         lastSampleTime = nil
         smoothedSpeed = 0
         UIApplication.shared.isIdleTimerDisabled = true
+        startMemoryMonitor()
 
         Task.detached(priority: .userInitiated) { [weak self] in
             do {
@@ -148,6 +152,7 @@ final class JobModel: ObservableObject {
                     if let error = error as? TranscodeError,
                        case .cancelled = error {
                         UIApplication.shared.isIdleTimerDisabled = false
+                        self.stopMemoryMonitor()
                         self.phase = .ready
                         self.statusText = "已取消，可以重新开始"
                         self.progress = 0
@@ -157,6 +162,7 @@ final class JobModel: ObservableObject {
                         return
                     }
                     UIApplication.shared.isIdleTimerDisabled = false
+                    self.stopMemoryMonitor()
                     self.phase = .failed
                     self.statusText = "处理失败"
                     self.errorText = error.localizedDescription
@@ -203,6 +209,7 @@ final class JobModel: ObservableObject {
         speedText = ""
         fpsText = ""
         etaText = ""
+        stopMemoryMonitor()
         let attributes = try? FileManager.default.attributesOfItem(atPath: result.outputURL.path)
         let bytes = (attributes?[.size] as? Int64) ?? 0
         var info = String(
@@ -239,6 +246,7 @@ final class JobModel: ObservableObject {
         speedText = String(format: "%.2fx 实时", smoothedSpeed)
         let speed = smoothedSpeed
         if speed > 0.001 {
+            let processed = sourceDuration * percent
             let remaining = (sourceDuration - processed) / speed
             if remaining > 1 {
                 etaText = "剩余约 " + Self.durationText(remaining)
@@ -246,6 +254,36 @@ final class JobModel: ObservableObject {
                 etaText = ""
             }
         }
+    }
+
+    private func startMemoryMonitor() {
+        stopMemoryMonitor()
+        memoryTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self = self else { return }
+                self.memoryText = String(format: "内存 %.0f MB", self.residentMemoryMB())
+            }
+        }
+        memoryText = String(format: "内存 %.0f MB", residentMemoryMB())
+    }
+
+    private func stopMemoryMonitor() {
+        memoryTimer?.invalidate()
+        memoryTimer = nil
+        memoryText = ""
+    }
+
+    /// 当前 App 常驻内存（MB），用来观察长时间转码时是否持续上涨。
+    private func residentMemoryMB() -> Double {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer -> kern_return_t in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { rebound in
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), rebound, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return Double(info.resident_size) / 1024.0 / 1024.0
     }
 
     static func durationText(_ seconds: Double) -> String {
@@ -413,6 +451,9 @@ struct ContentView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Text(job.fpsText)
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                            Text(job.memoryText)
                                 .font(.caption2)
                                 .foregroundStyle(.tertiary)
                         }

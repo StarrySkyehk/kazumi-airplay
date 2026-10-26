@@ -449,6 +449,7 @@ final class OfflineTranscoder {
         var windowStart = CACurrentMediaTime()
         var windowFrames = 0
         var currentFPS: Double = 0
+        var framesSinceCacheFlush = 0
 
         input.requestMediaDataWhenReady(on: DispatchQueue(label: "anime4k.feed")) {
             if finished { return }
@@ -487,6 +488,11 @@ final class OfflineTranscoder {
                         return
                     }
                     windowFrames += 1
+                    framesSinceCacheFlush += 1
+                    if framesSinceCacheFlush >= 30 {
+                        framesSinceCacheFlush = 0
+                        CVMetalTextureCacheFlush(self.textureCache, 0)
+                    }
                     let nowTime = CACurrentMediaTime()
                     let windowElapsed = nowTime - windowStart
                     if windowElapsed >= 0.75 {
