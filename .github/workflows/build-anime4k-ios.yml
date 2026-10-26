@@ -39,7 +39,7 @@ jobs:
           cd anime4k-ios
           xcodebuild \
             -project Anime4KTool.xcodeproj \
-            -target Anime4KTool \
+            -scheme Anime4KTool \
             -configuration Release \
             -sdk iphoneos \
             -destination "generic/platform=iOS" \
