@@ -1,0 +1,86 @@
+name: anime4k-ios-ipa
+
+# Builds the standalone "Anime4K 超分" iOS app (native SwiftUI, no Flutter) as an
+# unsigned IPA for sideloading.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'macOS runner image'
+        required: true
+        default: 'xcode-27'
+        type: choice
+        options:
+          - xcode-27
+          - macos-26
+          - macos-latest
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "Build Anime4KTool unsigned IPA"
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode
+        run: |
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Build app (no codesign)
+        run: |
+          set -euo pipefail
+          cd anime4k-ios
+          xcodebuild \
+            -project Anime4KTool.xcodeproj \
+            -target Anime4KTool \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination "generic/platform=iOS" \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            ONLY_ACTIVE_ARCH=NO \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="anime4k-ios/build/Build/Products/Release-iphoneos/Anime4KTool.app"
+          test -d "$APP"
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$APP" Payload/Anime4KTool.app
+          # Ad-hoc sign only the app binary so iOS tooling is happy; iloader re-signs it anyway.
+          codesign --force --sign - --timestamp=none Payload/Anime4KTool.app/Anime4KTool || true
+          OUT="Anime4KTool_ios_no_sign.ipa"
+          zip -q -r "$OUT" Payload
+          ls -lh "$OUT"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: anime4k_ios_ipa
+          path: Anime4KTool_ios_no_sign.ipa
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: always()
+        run: |
+          mkdir -p logs || true
+          xcodebuild -version > logs/xcode.txt 2>&1 || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anime4k_build_logs
+          path: logs/
+          if-no-files-found: ignore
