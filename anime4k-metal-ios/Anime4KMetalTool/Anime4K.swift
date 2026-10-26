@@ -17,6 +17,10 @@ import Foundation
 import MetalKit
 
 class Anime4K {
+    /// 供命令行冒烟测试注入自定义资源（正常 App 中保持 nil）。
+    static var bundleOverride: Bundle?
+    static var libraryOverride: MTLLibrary?
+
     #if targetEnvironment(macCatalyst)
     static let bufferCount = 3
     #else
@@ -52,7 +56,8 @@ class Anime4K {
         self.pipelineStates = []
         self.textureMap = []
         self.sizeMap = [:]
-        guard let glslFile = Bundle(for: Anime4K.self).url(forResource: name, withExtension: nil, subdirectory: "glsl/" + subdir) else {
+        let resourceBundle = Anime4K.bundleOverride ?? Bundle(for: Anime4K.self)
+        guard let glslFile = resourceBundle.url(forResource: name, withExtension: nil, subdirectory: "glsl/" + subdir) else {
             throw Anime4KError.fileNotFound(name)
         }
         let data = try Data(contentsOf: glslFile)
@@ -66,7 +71,11 @@ class Anime4K {
             print(shader.metalCode)
             return try device.makeLibrary(source: shader.metalCode, options: nil)
         }
-        defaultLibrary = try device.makeDefaultLibrary(bundle: .main)
+        if let overrideLibrary = Anime4K.libraryOverride {
+            defaultLibrary = overrideLibrary
+        } else {
+            defaultLibrary = try device.makeDefaultLibrary(bundle: .main)
+        }
     }
     
     func compileShaders(_ device: MTLDevice, videoInW: Int, videoInH: Int, textureInW: Int, textureInH: Int, displayOutW: Int, displayOutH: Int) throws {

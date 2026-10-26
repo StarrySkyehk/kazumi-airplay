@@ -69,3 +69,18 @@ jobs:
           name: anime4k_metal_ios_ipa
           path: Anime4KMetalTool_ios_no_sign.ipa
           if-no-files-found: error
+
+      - name: Smoke test Anime4K engine (GLSL→Metal + real transcode)
+        run: |
+          bash anime4k-metal-ios/Harness/run.sh
+
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anime4k_metal_smoke
+          path: |
+            anime4k-metal-ios/Harness/build/out.mp4
+            anime4k-metal-ios/Harness/build/*.log
+          if-no-files-found: ignore
+          retention-days: 7
