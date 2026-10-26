@@ -58,8 +58,10 @@ scripts/sync-overlay.sh           # 把本地改动同步进 overlay/ 的工具�
   上滚·顶部·底部开关（投屏开始时下发快照）；描边改为内缩绘制 + 像素对齐 + 屏幕 scale，修复裁切/发虚
 - **离线视频可投屏**：本地 mp4 直接播放；本地 HLS（`playlist.m3u8` + `seg_*.ts`）通过
   `AVAssetResourceLoader` 自定义 scheme 提供给 AVPlayer；不支持的容器给出明确提示
-- **超分辨率**：AVPlayer 独立解码无法使用 mpv 的 Anime4K 着色器（遥控页会显示提示），后续如需要
-  可改为「眼镜上跑第二个 Flutter 引擎 + mpv」的方案
+- **超分辨率（v14+）**：在眼镜端用 Core Image 管线做独立超分（边缘保留放大 CIEdgePreserveUpsample
+  + 亮度锐化 CISharpenLuminance，AVPlayer 解码 → CIImage → CAMetalLayer）；手机设置里的超分设为
+  「效率档/质量档」时投屏自动启用，遥控页显示状态。它与手机端 Anime4K 不等价（没有线条加深/CNN），
+  若 2 秒内没有出帧会自动回退到普通投屏。要做 100% 一致需要把眼镜端播放改成第二个 Flutter 引擎 + mpv。
 
 ## 已知限制
 

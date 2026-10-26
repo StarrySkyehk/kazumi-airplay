@@ -251,7 +251,7 @@ final class ARVideoUpscalerRenderer {
     private let player: AVPlayer
     private weak var playerItem: AVPlayerItem?
     private let videoOutput: AVPlayerItemVideoOutput
-    private let ciContext: CIContext?
+    private let ciContext: CIContext
     private let commandQueue: MTLCommandQueue?
     private let quality: Bool
     let renderLayer: CAMetalLayer
@@ -267,14 +267,14 @@ final class ARVideoUpscalerRenderer {
 
     init?(player: AVPlayer, item: AVPlayerItem, quality: Bool) {
         guard let device = MTLCreateSystemDefaultDevice(),
-              let queue = device.makeCommandQueue(),
-              let context = CIContext(
-                  mtlDevice: device,
-                  options: [.cacheIntermediates: false]
-              )
+              let queue = device.makeCommandQueue()
         else {
             return nil
         }
+        let context = CIContext(
+            mtlDevice: device,
+            options: [.cacheIntermediates: false]
+        )
         self.player = player
         self.playerItem = item
         self.quality = quality
@@ -359,12 +359,12 @@ final class ARVideoUpscalerRenderer {
     }
 
     private func render(_ image: CIImage, drawable: CAMetalDrawable) {
-        guard let context = ciContext,
-              let commandQueue = commandQueue,
+        guard let commandQueue = commandQueue,
               let commandBuffer = commandQueue.makeCommandBuffer()
         else {
             return
         }
+        let context = ciContext
         let target = CGRect(origin: .zero, size: renderLayer.drawableSize)
         let extent = image.extent
         guard target.width > 1, target.height > 1,
