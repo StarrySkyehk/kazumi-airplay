@@ -322,8 +322,8 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
           const SizedBox(height: 12),
           Text(
             _upscalerActive
-                ? 'AR 眼镜端超分已启用（边缘保留放大 + 锐化）'
-                : 'AR 眼镜端超分正在初始化…（若始终不生效将退回普通投屏）',
+                ? 'AR 眼镜端超分已启用（Lanczos 放大 + 锐化）'
+                : '超分未生效，已回退普通投屏',
             textAlign: TextAlign.center,
             style: textTheme.bodySmall?.copyWith(color: Colors.white38),
           ),

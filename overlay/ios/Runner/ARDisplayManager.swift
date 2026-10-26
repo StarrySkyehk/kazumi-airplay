@@ -174,6 +174,11 @@ final class ARDisplayManager: NSObject {
     private var danmakuConfig = ARDanmakuConfig.default
     private var superResolutionRequested = false
     private var superResolutionQuality = false
+    /// True when the current item actually carries the Core Image video composition.
+    private var superResolutionApplied = false
+    /// Last validated media source, kept so a failed SR composition can be retried without it.
+    private var lastStartSource: ARStartSource?
+    private var didFallbackFromSuperResolution = false
 
     // MARK: Local playback
 
@@ -368,14 +373,21 @@ final class ARDisplayManager: NSObject {
 
         configureAudioSession()
 
-        guard let item = makePlayerItem(for: source) else {
+        lastStartSource = source
+        didFallbackFromSuperResolution = false
+        guard let item = makePlayerItem(
+            for: source,
+            superResolution: superResolutionRequested,
+            quality: superResolutionQuality
+        ) else {
             teardownPlayback()
             result(ARDisplayManager.startFailure("该本地视频格式不支持投放"))
             return
         }
+        superResolutionApplied = item.videoComposition != nil
         let newPlayer = AVPlayer(playerItem: item)
         newPlayer.actionAtItemEnd = .pause
-        logStep("start: player item ready")
+        logStep("start: player item ready, superResolution=\(superResolutionApplied)")
 
         player = newPlayer
         playerItem = item
@@ -767,10 +779,6 @@ final class ARDisplayManager: NSObject {
             enabled: danmakuEnabled,
             config: danmakuConfig
         )
-        viewController.setSuperResolution(
-            enabled: superResolutionRequested,
-            quality: superResolutionQuality
-        )
         viewController.showIdleState(false)
         applySeek(toMilliseconds: pendingStartPositionMilliseconds)
         startPlayback()
@@ -1026,8 +1034,9 @@ final class ARDisplayManager: NSObject {
 
         // Keep the external window and the accessory registration alive: the glasses switch to
         // the idle page and the next `start` is available immediately (no mirroring in between).
+        superResolutionApplied = false
+        didFallbackFromSuperResolution = false
         if let viewController = displayViewController {
-            viewController.setSuperResolution(enabled: false, quality: false)
             viewController.attach(player: nil)
             viewController.configureDanmaku(items: [], enabled: danmakuEnabled, config: danmakuConfig)
             viewController.showIdleState(true)
@@ -1137,6 +1146,9 @@ final class ARDisplayManager: NSObject {
         guard let item = playerItem else { return }
         switch item.status {
         case .failed:
+            if attemptRetryWithoutSuperResolution(reason: item.error?.localizedDescription) {
+                return
+            }
             handlePlaybackFailed(message: item.error?.localizedDescription)
         case .readyToPlay:
             if lastKnownError != nil {
@@ -1194,7 +1206,7 @@ final class ARDisplayManager: NSObject {
             "ended": playbackEnded,
             "windowVisible": isExternalWindowVisible(),
             "sceneState": externalSceneStateDescription(),
-            "upscalerActive": displayViewController?.isSuperResolutionActive ?? false,
+            "upscalerActive": superResolutionApplied,
         ]
         if let lastKnownError = lastKnownError {
             payload["error"] = lastKnownError
@@ -1216,6 +1228,101 @@ final class ARDisplayManager: NSObject {
         let seconds = item.duration.seconds
         guard seconds.isFinite, seconds > 0 else { return 0 }
         return Int((seconds * 1000.0).rounded())
+    }
+
+    /// Wraps an asset into an `AVPlayerItem` and optionally applies the SR video composition.
+    private func makeItem(
+        asset: AVURLAsset,
+        superResolution: Bool,
+        quality: Bool
+    ) -> AVPlayerItem {
+        let item = AVPlayerItem(asset: asset)
+        if superResolution,
+           let composition = ARDisplayManager.makeSuperResolutionComposition(
+               asset: asset,
+               quality: quality
+           ) {
+            item.videoComposition = composition
+        }
+        return item
+    }
+
+    /// Builds the Core Image video composition used for AR-side super resolution.
+    ///
+    /// Apple's `AVVideoComposition(applyingCIFiltersWithHandler:)` runs the filter graph inside
+    /// AVFoundation's own pipeline (timing, audio and vsync stay untouched), which is far more
+    /// robust than rendering frames by hand: Lanczos upscale to the glasses' 1920x1080 output,
+    /// then luminance sharpening. On unsupported assets the item simply fails and the caller
+    /// retries without the composition.
+    private static func makeSuperResolutionComposition(
+        asset: AVAsset,
+        quality: Bool
+    ) -> AVVideoComposition? {
+        let renderSize = CGSize(width: 1920, height: 1080)
+        let composition = AVMutableVideoComposition(asset: asset) { request in
+            let source = request.sourceImage
+            let extent = source.extent
+            guard extent.width > 1, extent.height > 1,
+                  extent.width.isFinite, extent.height.isFinite
+            else {
+                request.finish(with: request.sourceImage, context: nil)
+                return
+            }
+            let scale = min(renderSize.width / extent.width, renderSize.height / extent.height)
+            var image = source
+            if abs(scale - 1.0) > 0.001 {
+                image = image.applyingFilter("CILanczosScaleTransform", parameters: [
+                    kCIInputScaleKey: scale,
+                    kCIInputAspectRatioKey: 1.0,
+                ])
+            }
+            let scaledExtent = image.extent
+            image = image.transformed(by: CGAffineTransform(
+                translationX: (renderSize.width - scaledExtent.width) / 2 - scaledExtent.origin.x,
+                y: (renderSize.height - scaledExtent.height) / 2 - scaledExtent.origin.y
+            ))
+            image = image.applyingFilter("CISharpenLuminance", parameters: [
+                kCIInputSharpnessKey: quality ? 0.8 : 0.5,
+            ])
+            let target = CGRect(origin: .zero, size: renderSize)
+            let background = CIImage(color: CIColor.black).cropped(to: target)
+            let composed = image.composited(over: background).cropped(to: target)
+            request.finish(with: composed, context: nil)
+        }
+        composition.renderSize = renderSize
+        return composition
+    }
+
+    /// Retries the current item without the SR composition when AVFoundation rejects it.
+    private func attemptRetryWithoutSuperResolution(reason: String?) -> Bool {
+        guard superResolutionApplied,
+              !didFallbackFromSuperResolution,
+              let source = lastStartSource,
+              let player = player
+        else {
+            return false
+        }
+        didFallbackFromSuperResolution = true
+        let position = pendingStartPositionMilliseconds > 0
+            ? pendingStartPositionMilliseconds
+            : Double(currentPositionMilliseconds())
+        logStep("super resolution item failed (\(reason ?? "unknown")), retrying without it")
+        guard let plainItem = makePlayerItem(
+            for: source,
+            superResolution: false,
+            quality: false
+        ) else {
+            return false
+        }
+        superResolutionApplied = false
+        removePlayerObservers()
+        playerItem = plainItem
+        installPlayerObservers(for: player, item: plainItem)
+        player.replaceCurrentItem(with: plainItem)
+        applySeek(toMilliseconds: position)
+        startPlayback()
+        sendStateEvent()
+        return true
     }
 
     // MARK: - Audio session
@@ -1355,7 +1462,11 @@ final class ARDisplayManager: NSObject {
     /// Local single files use a plain `file://` URL; local HLS playlists are re-served under
     /// `kazumi-local://local/<playlist.m3u8>` so AVFoundation asks the resource loader for both
     /// the playlist and the sibling `seg_*.ts` files. Network sources keep the HTTP headers.
-    private func makePlayerItem(for source: ARStartSource) -> AVPlayerItem? {
+    private func makePlayerItem(
+        for source: ARStartSource,
+        superResolution: Bool,
+        quality: Bool
+    ) -> AVPlayerItem? {
         releaseLocalPlaybackResources()
         switch source {
         case .remote(let url, let headers):
@@ -1369,13 +1480,21 @@ final class ARDisplayManager: NSObject {
                 // key; the app already relies on it in `openVideoWithReferer`.
                 asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
             }
-            return AVPlayerItem(asset: asset)
+            return makeItem(
+                asset: asset,
+                superResolution: superResolution,
+                quality: quality
+            )
 
         case .localFile(let fileURL):
             isLocalPlaybackSession = true
             isLocalHLSSession = false
             arLog("local file playback: \(fileURL.lastPathComponent)")
-            return AVPlayerItem(asset: AVURLAsset(url: fileURL))
+            return makeItem(
+                asset: AVURLAsset(url: fileURL),
+                superResolution: superResolution,
+                quality: quality
+            )
 
         case .localHLS(let playlistURL):
             isLocalPlaybackSession = true
@@ -1396,7 +1515,11 @@ final class ARDisplayManager: NSObject {
             localResourceLoaderDelegate = loader
             localHLSAsset = asset
             arLog("local HLS playback: \(playlistURL.lastPathComponent)")
-            return AVPlayerItem(asset: asset)
+            return makeItem(
+                asset: asset,
+                superResolution: superResolution,
+                quality: quality
+            )
         }
     }
 
