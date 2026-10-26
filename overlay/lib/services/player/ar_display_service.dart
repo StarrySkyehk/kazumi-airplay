@@ -52,13 +52,15 @@ class ARDisplayService {
     required List<ARDisplayDanmakuItem> danmaku,
     required bool danmakuEnabled,
     required Map<String, Object?> danmakuConfig,
+    required bool superResolution,
+    required bool superResolutionQuality,
   }) async {
     if (!Platform.isIOS) {
       return const ARDisplayStartResult.failed('当前平台不支持 AR 眼镜播放');
     }
     KazumiLogger().i(
       'ARDisplayService: start url=${isLocalFile ? 'local' : 'remote'} '
-      'pos=${positionMs}ms danmaku=${danmaku.length}',
+      'pos=${positionMs}ms danmaku=${danmaku.length} sr=$superResolution',
     );
     final map = await _invokeMap('start', <String, Object?>{
       'url': url,
@@ -71,6 +73,8 @@ class ARDisplayService {
       ],
       'danmakuEnabled': danmakuEnabled,
       'danmakuConfig': danmakuConfig,
+      'superResolution': superResolution,
+      'superResolutionQuality': superResolutionQuality,
     }).timeout(
       const Duration(seconds: 12),
       onTimeout: () {
@@ -359,6 +363,7 @@ sealed class ARDisplayEvent {
           error: _asOptionalString(map['error']),
           windowVisible: map['windowVisible'] != false,
           sceneState: _asOptionalString(map['sceneState']),
+          upscalerActive: map['upscalerActive'] == true,
         );
       case 'error':
         return ARDisplayErrorEvent(
@@ -401,6 +406,7 @@ class ARDisplayStateEvent extends ARDisplayEvent {
     this.error,
     this.windowVisible = true,
     this.sceneState,
+    this.upscalerActive = false,
   });
 
   final bool playing;
@@ -415,6 +421,9 @@ class ARDisplayStateEvent extends ARDisplayEvent {
 
   /// 原生外接屏场景的激活状态（诊断用，如 foregroundActive）。
   final String? sceneState;
+
+  /// AR 端超分渲染器是否真的在出帧。
+  final bool upscalerActive;
 }
 
 /// 致命错误（如 AVPlayerItem 失败）。

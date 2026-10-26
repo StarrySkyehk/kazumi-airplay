@@ -61,6 +61,7 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
   int _screenHeight = 0;
   bool _windowVisible = true;
   String? _sceneState;
+  bool _upscalerActive = false;
 
   bool get _canControl => _connected && _error == null;
 
@@ -129,6 +130,7 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
           :final error,
           :final windowVisible,
           :final sceneState,
+          :final upscalerActive,
         ):
         setState(() {
           _playing = playing;
@@ -136,6 +138,7 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
           _ended = ended;
           _windowVisible = windowVisible;
           _sceneState = sceneState;
+          _upscalerActive = upscalerActive;
           if (durationMs > 0) {
             _durationMs = durationMs;
           }
@@ -318,7 +321,9 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
         if (widget.superResolutionActive) ...[
           const SizedBox(height: 12),
           Text(
-            'AR 眼镜模式使用独立解码，手机端超分辨率（Anime4K）不生效',
+            _upscalerActive
+                ? 'AR 眼镜端超分已启用（边缘保留放大 + 锐化）'
+                : 'AR 眼镜端超分正在初始化…（若始终不生效将退回普通投屏）',
             textAlign: TextAlign.center,
             style: textTheme.bodySmall?.copyWith(color: Colors.white38),
           ),

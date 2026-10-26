@@ -172,6 +172,8 @@ final class ARDisplayManager: NSObject {
     private var danmakuItems: [ARDanmakuItem] = []
     private var danmakuEnabled = true
     private var danmakuConfig = ARDanmakuConfig.default
+    private var superResolutionRequested = false
+    private var superResolutionQuality = false
 
     // MARK: Local playback
 
@@ -381,6 +383,8 @@ final class ARDisplayManager: NSObject {
         danmakuItems = ARDisplayManager.parseDanmakuItems(payload["danmaku"])
         danmakuEnabled = (payload["danmakuEnabled"] as? Bool) ?? true
         danmakuConfig = ARDisplayManager.parseDanmakuConfig(payload)
+        superResolutionRequested = (payload["superResolution"] as? Bool) ?? false
+        superResolutionQuality = (payload["superResolutionQuality"] as? Bool) ?? false
         playbackSpeed = 1.0
         playbackEnded = false
         lastKnownError = nil
@@ -763,6 +767,10 @@ final class ARDisplayManager: NSObject {
             enabled: danmakuEnabled,
             config: danmakuConfig
         )
+        viewController.setSuperResolution(
+            enabled: superResolutionRequested,
+            quality: superResolutionQuality
+        )
         viewController.showIdleState(false)
         applySeek(toMilliseconds: pendingStartPositionMilliseconds)
         startPlayback()
@@ -1019,6 +1027,7 @@ final class ARDisplayManager: NSObject {
         // Keep the external window and the accessory registration alive: the glasses switch to
         // the idle page and the next `start` is available immediately (no mirroring in between).
         if let viewController = displayViewController {
+            viewController.setSuperResolution(enabled: false, quality: false)
             viewController.attach(player: nil)
             viewController.configureDanmaku(items: [], enabled: danmakuEnabled, config: danmakuConfig)
             viewController.showIdleState(true)
@@ -1185,6 +1194,7 @@ final class ARDisplayManager: NSObject {
             "ended": playbackEnded,
             "windowVisible": isExternalWindowVisible(),
             "sceneState": externalSceneStateDescription(),
+            "upscalerActive": displayViewController?.isSuperResolutionActive ?? false,
         ]
         if let lastKnownError = lastKnownError {
             payload["error"] = lastKnownError

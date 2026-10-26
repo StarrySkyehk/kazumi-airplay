@@ -1324,6 +1324,10 @@ class _PlayerItemState extends State<PlayerItem>
         danmaku: danmaku,
         danmakuEnabled: playerController.danmaku.danmakuOn,
         danmakuConfig: danmakuConfig,
+        superResolution: superResolutionActive,
+        superResolutionQuality:
+            playerController.playback.superResolutionMode ==
+                SuperResolutionMode.quality,
       );
       KazumiLogger().i(
         'AR: native start returned ok=${startResult.ok} '

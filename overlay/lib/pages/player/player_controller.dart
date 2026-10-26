@@ -524,12 +524,14 @@ class PlayerController implements Disposable {
     // mpv 仍在（投屏前的后台释放还没完成/失败）：直接 seek 恢复，不再重建播放器。
     if (playback.mediaPlayer != null) {
       try {
-        await seek(Duration(milliseconds: safePositionMs));
+        await seek(Duration(milliseconds: safePositionMs))
+            .timeout(const Duration(seconds: 8));
         if (resumePlaying) {
-          await play();
+          await play().timeout(const Duration(seconds: 8), onTimeout: () {});
         } else {
-          await pause();
+          await pause().timeout(const Duration(seconds: 8), onTimeout: () {});
         }
+        playback.loading = false;
         KazumiLogger().i('PlayerController: resumed existing player after AR');
         return true;
       } catch (error, stackTrace) {
