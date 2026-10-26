@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:flutter_modular/flutter_modular.dart';
+import 'package:kazumi/bean/dialog/dialog_helper.dart';
 import 'package:kazumi/services/player/external_playback_launcher.dart';
 import 'package:kazumi/pages/player/controller/player_danmaku_controller.dart';
 import 'package:kazumi/pages/player/controller/player_debug_controller.dart';
@@ -41,6 +42,10 @@ class PlayerController implements Disposable {
   final AudioController audioController;
   final AsyncSessionOwner _initializations = AsyncSessionOwner();
   Future<void>? _shutdownFuture;
+
+  /// 最近一次 [init] 的入参。AR 眼镜投屏结束后用它重建同一路播放。
+  PlaybackInitParams? _lastPlaybackInitParams;
+
   final PlayerPanelController panel = PlayerPanelController();
   final PlayerScreenshotController screenshots = PlayerScreenshotController();
   final PlayerDebugController debug = PlayerDebugController();
@@ -184,6 +189,7 @@ class PlayerController implements Disposable {
     if (_initializations.isClosed) {
       return false;
     }
+    _lastPlaybackInitParams = params;
     final initialization = _initializations.begin();
 
     videoUrl = params.videoUrl;
@@ -454,6 +460,85 @@ class PlayerController implements Disposable {
   Future<void> stop() async {
     _initializations.cancel();
     await _releasePlaybackResources();
+  }
+
+  /// AR 眼镜投屏前释放手机端播放：与 [init] 复用同一条释放路径（停掉 mpv、
+  /// 关闭网络/磁盘缓存、释放音频会话），但保留 controller 自身与 [_lastPlaybackInitParams]。
+  ///
+  /// 成功后 [PlayerPlaybackController.mediaPlayer] 为 null，AR 期间手机上不会
+  /// 出现第二路解码/缓存。
+  Future<bool> releasePlaybackForExternalDisplay() async {
+    // 让仍在进行中的 init 失效，避免它在投屏期间重新装上一个 mpv 实例。
+    _initializations.cancel();
+    try {
+      await _releasePlaybackResources();
+    } catch (error, stackTrace) {
+      KazumiLogger().e(
+        'PlayerController: failed to release playback for AR display',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      return false;
+    }
+    return playback.mediaPlayer == null;
+  }
+
+  /// AR 眼镜投屏结束后重建播放。
+  ///
+  /// 用最后一次 [init] 的参数（offset 换成 [positionMs] 对应的秒数）重新初始化，
+  /// 再 seek 到 [positionMs]，并按 [resumePlaying] 恢复播放/暂停。
+  /// 失败时 toast 提示并返回 false。
+  Future<bool> resumePlaybackAfterExternalDisplay({
+    required int positionMs,
+    required bool resumePlaying,
+  }) async {
+    final PlaybackInitParams? params = _lastPlaybackInitParams;
+    if (params == null) {
+      _showArResumeFailureToast();
+      return false;
+    }
+    final int safePositionMs = positionMs < 0 ? 0 : positionMs;
+    final double previousSpeed = playback.playerSpeed;
+    final bool initialized = await init(
+      params.copyWithOffset((safePositionMs / 1000).round()),
+    );
+    if (!initialized) {
+      _showArResumeFailureToast();
+      return false;
+    }
+    // init() 会把倍速重置为设置里的默认值，这里恢复用户退出前的倍速。
+    if (previousSpeed > 0 && previousSpeed != playback.playerSpeed) {
+      await setPlaybackSpeed(previousSpeed);
+    }
+    final Player? player = playback.mediaPlayer;
+    if (player == null) {
+      _showArResumeFailureToast();
+      return false;
+    }
+    if (!resumePlaying) {
+      // init() 会按设置自动起播，先停住，避免退出投屏后突然出声。
+      await pause();
+    }
+    final Duration target = Duration(milliseconds: safePositionMs);
+    try {
+      await player.seek(target);
+      playback.currentPosition = target;
+    } catch (error, stackTrace) {
+      KazumiLogger().w(
+        'PlayerController: failed to restore position after AR display',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      KazumiDialog.showToast(message: '恢复播放进度失败，将从头继续播放');
+    }
+    if (resumePlaying) {
+      await play();
+    }
+    return true;
+  }
+
+  void _showArResumeFailureToast() {
+    KazumiDialog.showToast(message: 'AR 投屏结束后恢复播放失败，请重新打开该视频');
   }
 
   Future<Uint8List?> screenshotPng() => playback.screenshotPng();

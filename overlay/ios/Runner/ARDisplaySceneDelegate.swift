@@ -50,14 +50,24 @@ final class ARDisplaySceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     func sceneDidDisconnect(_ scene: UIScene) {
+        // The glasses were unplugged / the system took the scene away. Playback cannot continue
+        // without a picture; the manager stops it exactly once and keeps the accessory
+        // registration alive for the next connection.
         ARDisplayManager.shared.handleExternalSceneDisconnected()
         teardownWindow()
     }
 
+    func sceneDidBecomeActive(_ scene: UIScene) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        // Re-assert the external window on activation: when the scene connects while the phone
+        // display is still being mirrored, the window must be visible to take over the screen.
+        ARDisplayManager.shared.handleExternalSceneBecameActive(windowScene: windowScene)
+    }
+
     // MARK: - Window
 
-    /// Closes the external window immediately (used when playback stops, before the
-    /// runtime disconnects the scene).
+    /// Closes the external window (only used when the scene is genuinely going away, never on
+    /// `stop`: the window is permanent so the next projection does not fall back to mirroring).
     func closeWindow() {
         teardownWindow()
     }

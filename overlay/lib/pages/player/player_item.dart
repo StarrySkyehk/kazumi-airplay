@@ -100,11 +100,10 @@ class _PlayerItemState extends State<PlayerItem>
         ),
       );
 
-  // AR 眼镜原生弹幕以 1080p 下 42pt 为基准；手机端 compact 默认字号 16，
-  // 因此把用户字号换算成相对倍率再交给原生。
+  // AR 眼镜原生弹幕以手机端参考字号 16 为 1.0；协议 §一要求 clamp 到 0.4–3.0。
   static const double _arDanmakuFontReferenceSize = 16.0;
-  static const double _arDanmakuFontScaleMin = 0.5;
-  static const double _arDanmakuFontScaleMax = 2.0;
+  static const double _arDanmakuFontScaleMin = 0.4;
+  static const double _arDanmakuFontScaleMax = 3.0;
   bool _arDisplayInProgress = false;
   bool _arConnectingDialogVisible = false;
 
@@ -1167,6 +1166,39 @@ class _PlayerItemState extends State<PlayerItem>
     return 1;
   }
 
+  /// 当前 DanmakuScreen 实际生效的弹幕配置；画面尚未创建时返回 null。
+  DanmakuOption? _liveDanmakuOption() {
+    try {
+      return playerController.danmaku.canvasController.option;
+    } catch (_) {
+      // canvasController 是 late 字段，未创建时访问会抛错，回退到设置值。
+      return null;
+    }
+  }
+
+  /// 组装协议 §一的 `danmakuConfig`：优先用直播中的 [DanmakuOption]（用户本次
+  /// 调整立即生效），取不到时回退到 GStorage 设置值。
+  Map<String, Object?> _buildArDanmakuConfig() {
+    final DanmakuOption? option = _liveDanmakuOption();
+    final double fontSize = option?.fontSize ?? _fontSize;
+    final double strokeWidth =
+        option?.strokeWidth ?? (_border ? _danmakuBorderSize : 0.0);
+    return <String, Object?>{
+      'opacity': (option?.opacity ?? _opacity).clamp(0.1, 1.0),
+      'fontScale': (fontSize / _arDanmakuFontReferenceSize)
+          .clamp(_arDanmakuFontScaleMin, _arDanmakuFontScaleMax),
+      'area': (option?.area ?? _danmakuArea).clamp(0.0, 1.0),
+      'durationSeconds': option?.duration ?? _danmakuDuration,
+      'lineHeight': option?.lineHeight ?? _danmakuLineHeight,
+      'strokeWidth': strokeWidth,
+      'fontWeight': option?.fontWeight ?? _danmakuFontWeight,
+      'massiveMode': option?.massiveMode ?? _massiveMode,
+      'hideTop': option?.hideTop ?? _hideTop,
+      'hideScroll': option?.hideScroll ?? _hideScroll,
+      'hideBottom': option?.hideBottom ?? _hideBottom,
+    };
+  }
+
   /// 连接外接屏可能耗时（等系统创建外接屏场景），期间给用户一个不可取消的提示。
   void _showArConnectingDialog() {
     if (_arConnectingDialogVisible || !mounted) {
@@ -1207,8 +1239,8 @@ class _PlayerItemState extends State<PlayerItem>
     Navigator.of(context, rootNavigator: true).pop();
   }
 
-  /// 把 mpv 暂停后交给原生 AVPlayer，成功后进入手机遥控页；退出时回传原生
-  /// 播放位置并恢复 mpv。
+  /// 彻底释放手机端播放（mpv 与网络/磁盘缓存）后交给原生 AVPlayer，成功后
+  /// 进入手机遥控页；退出时回传原生位置并重建 mpv。
   Future<void> _startArDisplay() async {
     if (!Platform.isIOS) {
       return;
@@ -1223,28 +1255,38 @@ class _PlayerItemState extends State<PlayerItem>
     _arDisplayInProgress = true;
     final int startPositionMs =
         playerController.playback.playerPosition.inMilliseconds;
+    // 释放后 playback.duration 会归零，投屏页的时长必须提前取。
+    final int durationMs = playerController.playback.duration.inMilliseconds;
     final bool resumePlayback = playerController.playback.playing;
+    final bool superResolutionActive =
+        playerController.playback.superResolutionMode !=
+            SuperResolutionMode.off;
     final String displayTitle = playerController.displayTitle.isNotEmpty
         ? playerController.displayTitle
         : videoPageController.title;
     final List<ARDisplayDanmakuItem> danmaku = _buildArDisplayDanmaku();
+    final Map<String, Object?> danmakuConfig = _buildArDanmakuConfig();
     // 暂停期间停掉每秒同步：否则 paused 的 media_kit 状态会写入 audio_service
     // 并释放原生播放需要的 AVAudioSession，同时还会为空转的进度发弹幕。
     playerTimer?.cancel();
     _showArConnectingDialog();
     try {
       await playerController.pause();
+      // AR 期间手机上不允许再有第二路解码/缓存：先彻底释放 mpv。
+      final bool released =
+          await playerController.releasePlaybackForExternalDisplay();
+      if (!released) {
+        throw StateError('failed to release the mobile playback resources');
+      }
       final ARDisplayStartResult startResult = await ARDisplayService.start(
         url: playerController.videoUrl,
         headers: playerController.httpHeaders,
+        isLocalFile: playerController.isLocalPlayback,
         positionMs: startPositionMs,
         title: displayTitle,
         danmaku: danmaku,
         danmakuEnabled: playerController.danmaku.danmakuOn,
-        danmakuOpacity: _opacity,
-        danmakuFontSize: (_fontSize / _arDanmakuFontReferenceSize)
-            .clamp(_arDanmakuFontScaleMin, _arDanmakuFontScaleMax)
-            .toDouble(),
+        danmakuConfig: danmakuConfig,
       );
       _hideArConnectingDialog();
       if (!mounted) {
@@ -1259,9 +1301,9 @@ class _PlayerItemState extends State<PlayerItem>
         KazumiDialog.showToast(
           message: startResult.error ?? 'AR 眼镜投屏启动失败',
         );
-        // mpv 位置没有变化，不需要 seek，直接恢复播放与每秒同步。
+        // mpv 已被释放，必须按投屏起点重建（不能沿用旧的 mpv 位置）。
         await _resumeAfterArDisplay(
-          positionMs: null,
+          positionMs: startPositionMs,
           resumePlayback: resumePlayback,
         );
         return;
@@ -1275,17 +1317,19 @@ class _PlayerItemState extends State<PlayerItem>
           builder: (BuildContext context) => ARDisplayRemotePage(
             title: displayTitle,
             initialPositionMs: startPositionMs,
-            durationMs: playerController.playback.duration.inMilliseconds,
+            durationMs: durationMs,
             danmakuEnabled: playerController.danmaku.danmakuOn,
             danmakuCount: danmaku.length,
+            superResolutionActive: superResolutionActive,
           ),
         ),
       );
       if (!mounted) {
         return;
       }
+      // 原生没回传可信位置时退回到投屏起点，避免从 0 重新缓冲。
       await _resumeAfterArDisplay(
-        positionMs: endPositionMs,
+        positionMs: endPositionMs ?? startPositionMs,
         resumePlayback: resumePlayback,
       );
     } catch (error, stackTrace) {
@@ -1298,9 +1342,8 @@ class _PlayerItemState extends State<PlayerItem>
       await ARDisplayService.stop();
       if (mounted) {
         KazumiDialog.showToast(message: 'AR 眼镜投屏失败，请重试');
-        // 原生位置不可信，保持 mpv 当前位置恢复即可。
         await _resumeAfterArDisplay(
-          positionMs: null,
+          positionMs: startPositionMs,
           resumePlayback: resumePlayback,
         );
       }
@@ -1310,43 +1353,35 @@ class _PlayerItemState extends State<PlayerItem>
     }
   }
 
-  /// 退出投屏后恢复播放页：seek 到原生位置、按退出前状态恢复播放，最后恢复
-  /// 每秒同步（同步会重启弹幕/通知，因此放在播放恢复之后）。
+  /// 退出投屏后恢复播放页：重建 mpv 并 seek 到最终位置、按退出前状态恢复播放，
+  /// 最后恢复每秒同步（同步会重启弹幕/通知，因此放在播放恢复之后）。
   Future<void> _resumeAfterArDisplay({
-    required int? positionMs,
+    required int positionMs,
     required bool resumePlayback,
   }) async {
     if (!mounted) {
       return;
     }
-    if (positionMs != null && positionMs > 0) {
-      try {
-        await playerController.seek(Duration(milliseconds: positionMs));
-      } catch (error, stackTrace) {
-        KazumiLogger().w(
-          'PlayerItem: failed to restore position after AR display',
-          error: error,
-          stackTrace: stackTrace,
-        );
-      }
+    // 原生期间的进度与手机端暂停前的画面无关，先清屏避免恢复后残留旧弹幕。
+    try {
+      playerController.danmaku.clearAndInvalidateScheduledDanmakus();
+    } catch (_) {}
+    final bool resumed =
+        await playerController.resumePlaybackAfterExternalDisplay(
+      positionMs: positionMs,
+      resumePlaying: resumePlayback,
+    );
+    if (!resumed) {
+      KazumiLogger().e(
+        'PlayerItem: failed to resume playback after AR display',
+      );
+      return;
     }
     if (!mounted) {
       return;
     }
-    if (resumePlayback) {
-      try {
-        await playerController.play();
-      } catch (error, stackTrace) {
-        KazumiLogger().w(
-          'PlayerItem: failed to resume playback after AR display',
-          error: error,
-          stackTrace: stackTrace,
-        );
-      }
-    }
-    if (!mounted) {
-      return;
-    }
+    // 释放时 audio_service 的回调与音量监听都被解绑，重建后需要重新绑定。
+    unawaited(_bindAudioService());
     _restartPlayerTimer();
     showVideoController();
   }

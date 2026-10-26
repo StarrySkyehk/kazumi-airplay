@@ -20,6 +20,7 @@ class ARDisplayRemotePage extends StatefulWidget {
     required this.durationMs,
     required this.danmakuEnabled,
     required this.danmakuCount,
+    this.superResolutionActive = false,
   });
 
   final String title;
@@ -27,6 +28,10 @@ class ARDisplayRemotePage extends StatefulWidget {
   final int durationMs;
   final bool danmakuEnabled;
   final int danmakuCount;
+
+  /// 手机端是否开启了超分辨率（Anime4K）。AR 眼镜走独立解码，着色器不生效，
+  /// 状态区据此显示一行说明。
+  final bool superResolutionActive;
 
   @override
   State<ARDisplayRemotePage> createState() => _ARDisplayRemotePageState();
@@ -310,6 +315,14 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
           textAlign: TextAlign.center,
           style: textTheme.bodyMedium?.copyWith(color: Colors.white60),
         ),
+        if (widget.superResolutionActive) ...[
+          const SizedBox(height: 12),
+          Text(
+            'AR 眼镜模式使用独立解码，手机端超分辨率（Anime4K）不生效',
+            textAlign: TextAlign.center,
+            style: textTheme.bodySmall?.copyWith(color: Colors.white38),
+          ),
+        ],
         if (_buffering && _canControl) ...[
           const SizedBox(height: 16),
           const SizedBox(

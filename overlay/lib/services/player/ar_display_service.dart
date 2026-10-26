@@ -35,18 +35,23 @@ class ARDisplayService {
     return ARDisplayState.fromMap(map);
   }
 
-  /// 开始在 AR 眼镜上播放，并推送弹幕数据。
+  /// 开始在 AR 眼镜上播放，并推送弹幕数据与完整弹幕外观配置。
   ///
-  /// [danmakuFontSize] 是相对 1080p 参考字号（42pt）的倍率，1.0 为默认大小。
+  /// [isLocalFile] 为 true 时 [url] 是本地文件路径（可能带 `file://` 前缀），
+  /// 原生侧用 `AVAssetResourceLoader` 处理本地 HLS；网络地址不用 ResourceLoader。
+  ///
+  /// [danmakuConfig] 对应协议 §一：`opacity`、`fontScale`、`area`、
+  /// `durationSeconds`、`lineHeight`、`strokeWidth`、`fontWeight`、
+  /// `massiveMode`、`hideTop`、`hideScroll`、`hideBottom`。
   static Future<ARDisplayStartResult> start({
     required String url,
     required Map<String, String> headers,
+    required bool isLocalFile,
     required int positionMs,
     required String title,
     required List<ARDisplayDanmakuItem> danmaku,
     required bool danmakuEnabled,
-    required double danmakuOpacity,
-    required double danmakuFontSize,
+    required Map<String, Object?> danmakuConfig,
   }) async {
     if (!Platform.isIOS) {
       return const ARDisplayStartResult.failed('当前平台不支持 AR 眼镜播放');
@@ -54,14 +59,14 @@ class ARDisplayService {
     final map = await _invokeMap('start', <String, Object?>{
       'url': url,
       'headers': headers,
+      'isLocalFile': isLocalFile,
       'positionMs': positionMs,
       'title': title,
       'danmaku': <Map<String, Object>>[
         for (final item in danmaku) item.toMap(),
       ],
       'danmakuEnabled': danmakuEnabled,
-      'danmakuOpacity': danmakuOpacity,
-      'danmakuFontSize': danmakuFontSize,
+      'danmakuConfig': danmakuConfig,
     });
     if (map == null) {
       return const ARDisplayStartResult.failed('AR 眼镜投屏启动失败');

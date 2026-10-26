@@ -112,7 +112,20 @@ final class ARDisplayManager: NSObject {
     private static let methodChannelName = "com.predidit.kazumi/ar_display"
     private static let eventChannelName = "com.predidit.kazumi/ar_display_events"
     private static let startTimeoutSeconds: TimeInterval = 8.0
+    /// One-shot presentation kick when the accessory scene is still missing after `start`.
+    private static let startKickSeconds: TimeInterval = 2.5
+    /// A kick toggles `isEnabled=false` for this long before enabling it again.
+    private static let accessoryKickGapSeconds: TimeInterval = 0.25
+    /// After the pre-registration the accessory normally connects immediately; if the glasses
+    /// were already plugged in (app launched into mirroring) one kick is needed.
+    private static let preRegistrationKickSeconds: TimeInterval = 2.0
     private static let stateEventIntervalSeconds: Double = 0.25
+
+    /// Container extensions AVPlayer cannot decode on iOS. Rejecting them up front produces the
+    /// documented `该本地视频格式不支持投放` error instead of a generic AVFoundation failure.
+    private static let unsupportedLocalFileExtensions: Set<String> = [
+        "flv", "mkv", "avi", "wmv", "rmvb", "rm", "webm", "ogv", "vob",
+    ]
 
     // MARK: Flutter
 
@@ -158,8 +171,28 @@ final class ARDisplayManager: NSObject {
 
     private var danmakuItems: [ARDanmakuItem] = []
     private var danmakuEnabled = true
-    private var danmakuOpacity: CGFloat = 1.0
-    private var danmakuFontScale: CGFloat = 1.0
+    private var danmakuConfig = ARDanmakuConfig.default
+
+    // MARK: Local playback
+
+    /// Serves a local `.m3u8` + `seg_*.ts` pair; must stay alive while the session lasts.
+    private var localResourceLoaderDelegate: AVAssetResourceLoaderDelegate?
+    private var localHLSAsset: AVURLAsset?
+    /// True when the current session plays a local file (error messages differ).
+    private var isLocalPlaybackSession = false
+    /// True when the current local session is HLS (playlist served via the resource loader).
+    private var isLocalHLSSession = false
+
+    // MARK: Accessory presentation retries
+
+    private var accessoryKickWorkItem: DispatchWorkItem?
+    private var startKickWorkItem: DispatchWorkItem?
+    private var preRegistrationRetryCount = 0
+    private var preRegistrationKickScheduled = false
+    /// `true` while our own `isEnabled=false -> true` kick is in flight. A scene that connects
+    /// and immediately disconnects inside this window is an expected side effect of the kick,
+    /// not a user unplug: the pending `start` / player must survive it.
+    private var isKickInProgress = false
 
     // MARK: Pending `start`
 
@@ -197,6 +230,19 @@ final class ARDisplayManager: NSObject {
         let relay = ARDisplayEventRelay(sinkBox: eventSinkBox, manager: self)
         events.setStreamHandler(relay)
         eventRelay = relay
+    }
+
+    /// Schedules the permanent accessory pre-registration; called once by `AppDelegate`
+    /// shortly after the implicit Flutter engine is ready.
+    ///
+    /// `nonisolated` on purpose: `AppDelegate.didInitializeImplicitFlutterEngine` runs on the
+    /// engine callback thread and only has to hand off a delay, not touch main-actor state.
+    nonisolated static func scheduleAccessoryPreRegistration(after delay: TimeInterval) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0.0, delay)) {
+            arRunOnMainActor {
+                ARDisplayManager.shared.prepareAccessoryRegistrationIfNeeded()
+            }
+        }
     }
 
     /// Replays the current state when Dart (re)starts listening on the event channel.
@@ -244,14 +290,20 @@ final class ARDisplayManager: NSObject {
 
     private func handleGetState(result: @escaping FlutterResult) {
         if #available(iOS 27.0, *) {
-            let registrationAvailable = registeredAccessory?.isAvailable ?? false
+            let registration = registeredAccessory
             result([
+                // `connected` keeps its v1 meaning: the external scene is actually connected.
+                // The accessory being merely registered/enabled is reported separately.
+                "connected": isDisplayConnected,
                 "supported": true,
-                "connected": isDisplayConnected || registrationAvailable,
-                "available": registrationAvailable,
+                "available": registration?.isAvailable ?? false,
+                "enabled": registration?.isEnabled ?? false,
+                "registered": registration != nil,
                 "screens": UIScreen.screens.count,
                 "screenWidth": screenWidth,
                 "screenHeight": screenHeight,
+                "windowVisible": isExternalWindowVisible(),
+                "sceneState": externalSceneStateDescription(),
             ])
         } else {
             result([
@@ -274,12 +326,21 @@ final class ARDisplayManager: NSObject {
             result(ARDisplayManager.startFailure("参数无效"))
             return
         }
-        guard let urlString = payload["url"] as? String,
-              !urlString.isEmpty,
-              let url = URL(string: urlString),
-              url.scheme?.isEmpty == false
-        else {
+        guard let urlString = payload["url"] as? String, !urlString.isEmpty else {
             result(ARDisplayManager.startFailure("视频地址无效"))
+            return
+        }
+        let isLocalFile = (payload["isLocalFile"] as? Bool) ?? false
+
+        // Validate (and for local files: existence + format) BEFORE touching the running
+        // session, so a bad request does not stop what is already on the glasses.
+        let resolution = ARDisplayManager.resolveStartSource(
+            urlString: urlString,
+            headers: payload["headers"],
+            isLocalFile: isLocalFile
+        )
+        guard let source = resolution.source else {
+            result(ARDisplayManager.startFailure(resolution.error ?? "视频地址无效"))
             return
         }
         guard let hostViewController = ARDisplayManager.activeFlutterViewController() else {
@@ -288,15 +349,17 @@ final class ARDisplayManager: NSObject {
         }
 
         // A second `start` replaces the previous session (the old call is resolved first).
-        // When the glasses scene is already alive it is reused instead of being torn down
-        // and re-created, which would otherwise be racy with the 1.5 s connect timeout.
-        let reusesExistingDisplay = isDisplayConnected && displayViewController != nil
-        teardownPlayback(keepingExternalDisplay: reusesExistingDisplay)
+        // The glasses window and the accessory registration survive: only the AVPlayer is
+        // detached, so an already-connected scene is reused immediately.
+        teardownPlayback()
 
         configureAudioSession()
 
-        let headers = ARDisplayManager.headerFields(from: payload["headers"])
-        let item = ARDisplayManager.makePlayerItem(url: url, headers: headers)
+        guard let item = makePlayerItem(for: source) else {
+            teardownPlayback()
+            result(ARDisplayManager.startFailure("该本地视频格式不支持投放"))
+            return
+        }
         let newPlayer = AVPlayer(playerItem: item)
         newPlayer.actionAtItemEnd = .pause
 
@@ -305,15 +368,17 @@ final class ARDisplayManager: NSObject {
         pendingStartPositionMilliseconds = ARDisplayManager.doubleValue(payload["positionMs"]) ?? 0
         danmakuItems = ARDisplayManager.parseDanmakuItems(payload["danmaku"])
         danmakuEnabled = (payload["danmakuEnabled"] as? Bool) ?? true
-        danmakuOpacity = CGFloat(ARDisplayManager.doubleValue(payload["danmakuOpacity"]) ?? 1.0)
-        danmakuFontScale = CGFloat(ARDisplayManager.doubleValue(payload["danmakuFontSize"]) ?? 1.0)
+        danmakuConfig = ARDisplayManager.parseDanmakuConfig(payload)
         playbackSpeed = 1.0
         playbackEnded = false
         lastKnownError = nil
         installPlayerObservers(for: newPlayer, item: item)
 
+        // The accessory is normally pre-registered ~1 s after app launch and stays enabled for
+        // the whole app lifetime; this only repairs a missing registration (e.g. `start` before
+        // the pre-registration timer fired).
         guard ensureAccessoryRegistration(hostViewController: hostViewController) else {
-            teardownPlayback(keepingExternalDisplay: false)
+            teardownPlayback()
             result(ARDisplayManager.startFailure("外接屏不可用"))
             return
         }
@@ -325,8 +390,11 @@ final class ARDisplayManager: NSObject {
             return
         }
 
+        // Registered + enabled, but the scene does not exist yet: wait for it, kicking the
+        // presentation once at 2.5 s, and fail after the 8 s budget.
         startPendingResult = result
         scheduleStartTimeout()
+        scheduleStartKick()
     }
 
     private func scheduleStartTimeout() {
@@ -345,6 +413,8 @@ final class ARDisplayManager: NSObject {
 
     private func handleStartTimeout() {
         startTimeoutWorkItem = nil
+        startKickWorkItem?.cancel()
+        startKickWorkItem = nil
         guard startPendingResult != nil else { return }
         var available = false
         var enabled = false
@@ -365,10 +435,36 @@ final class ARDisplayManager: NSObject {
 
         guard let pending = startPendingResult else { return }
         startPendingResult = nil
-        teardownPlayback(keepingExternalDisplay: false)
+        teardownPlayback()
         pending(ARDisplayManager.startFailure(
             "未检测到外接屏，请确认眼镜已用 USB‑C 连接（available=\(available) enabled=\(enabled) screens=\(screens)）"
         ))
+    }
+
+    /// Schedules the single presentation kick of a `start` that is still waiting for its scene.
+    ///
+    /// 2.5 s of grace before kicking: if the glasses were just plugged in, the system may be
+    /// mid-handshake and an immediate disable/enable would abort it. The total budget stays at
+    /// `startTimeoutSeconds` (8 s).
+    private func scheduleStartKick() {
+        startKickWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            arRunOnMainActor {
+                self?.handleStartKick()
+            }
+        }
+        startKickWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + ARDisplayManager.startKickSeconds,
+            execute: workItem
+        )
+    }
+
+    private func handleStartKick() {
+        startKickWorkItem = nil
+        guard startPendingResult != nil, !isDisplayConnected else { return }
+        arLog("start kick: scene not connected after \(ARDisplayManager.startKickSeconds)s, toggling accessory")
+        kickAccessoryPresentation()
     }
 
     /// Classic multiple-display fallback: attach the player to `UIScreen.screens[1]`.
@@ -403,16 +499,72 @@ final class ARDisplayManager: NSObject {
         return true
     }
 
-    /// Pre-registers the scene accessory (disabled) so the system already knows about it when
-    /// playback starts. Called shortly after app launch from `AppDelegate`.
+    /// Pre-registers the external-display scene accessory and keeps it registered + enabled
+    /// for the whole app lifetime.
+    ///
+    /// Device behaviour that drives this design: the system only hands the glasses scene to the
+    /// app when the accessory already exists (and is enabled) *before* the external display is
+    /// connected / mirrored. Registering it lazily on the first `start` therefore fails whenever
+    /// the glasses were already plugged in — the scene connects but the window never presents.
+    ///
+    /// Called ~1 s after app launch from `AppDelegate` (via
+    /// `scheduleAccessoryPreRegistration(after:)`), and again as a safety net from `start`.
     func prepareAccessoryRegistrationIfNeeded() {
         guard #available(iOS 27.0, *) else { return }
-        guard registeredAccessory == nil else { return }
-        guard let hostViewController = ARDisplayManager.activeFlutterViewController() else { return }
-        _ = ensureAccessoryRegistration(hostViewController: hostViewController)
-        setAccessoryEnabled(false)
+        if let registration = registeredAccessory {
+            // Permanent registration: never unregister, and repair a disabled state if some
+            // other component toggled it.
+            if !registration.isEnabled {
+                registration.isEnabled = true
+                arLog("accessory was disabled; re-enabled (permanent registration)")
+            }
+            startObservingExternalScreens()
+            return
+        }
+        guard let hostViewController = ARDisplayManager.activeFlutterViewController() else {
+            // The root Flutter view controller is not in a window yet (~1 s after engine init
+            // is usually enough, scene states can lag on cold start): retry briefly.
+            schedulePreRegistrationRetry()
+            return
+        }
+        guard ensureAccessoryRegistration(hostViewController: hostViewController) else { return }
+        setAccessoryEnabled(true)
         startObservingExternalScreens()
-        arLog("accessory pre-registered, available=\(registeredAccessory?.isAvailable ?? false)")
+        arLog("accessory pre-registered (enabled), available=\(registeredAccessory?.isAvailable ?? false)")
+        // If the glasses were already plugged in when the app launched, the system may already
+        // be mirroring: kick the presentation once shortly after pre-registration.
+        schedulePreRegistrationKick()
+    }
+
+    private func schedulePreRegistrationRetry() {
+        guard preRegistrationRetryCount < 20 else {
+            arLog("accessory pre-registration gave up: Flutter root view controller not found")
+            return
+        }
+        preRegistrationRetryCount += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            arRunOnMainActor {
+                self?.prepareAccessoryRegistrationIfNeeded()
+            }
+        }
+    }
+
+    private func schedulePreRegistrationKick() {
+        guard !preRegistrationKickScheduled else { return }
+        preRegistrationKickScheduled = true
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + ARDisplayManager.preRegistrationKickSeconds
+        ) { [weak self] in
+            arRunOnMainActor {
+                guard let self = self else { return }
+                guard #available(iOS 27.0, *) else { return }
+                guard !self.isDisplayConnected,
+                      let registration = self.registeredAccessory
+                else { return }
+                arLog("pre-registration kick: scene not connected (enabled=\(registration.isEnabled))")
+                self.kickAccessoryPresentation()
+            }
+        }
     }
 
     private func startObservingExternalScreens() {
@@ -421,8 +573,11 @@ final class ARDisplayManager: NSObject {
             forName: UIScreen.didConnectNotification,
             object: nil,
             queue: .main
-        ) { _ in
+        ) { [weak self] _ in
             arLog("UIScreen did connect, count=\(UIScreen.screens.count)")
+            arRunOnMainActor {
+                self?.handleExternalScreenDidConnect()
+            }
         }
         screenDisconnectObserver = NotificationCenter.default.addObserver(
             forName: UIScreen.didDisconnectNotification,
@@ -433,8 +588,48 @@ final class ARDisplayManager: NSObject {
             arRunOnMainActor {
                 guard manager.legacyExternalWindow != nil else { return }
                 arLog("legacy external screen disconnected")
-                manager.teardownPlayback(keepingExternalDisplay: false)
+                manager.handleLegacyExternalScreenDisconnected()
             }
+        }
+    }
+
+    /// Called when the system reports a newly attached external screen.
+    ///
+    /// The accessory is normally already enabled (it is kept enabled for the app lifetime), so
+    /// this mostly records diagnostics; if a `start` is waiting and the registration got
+    /// disabled somehow, it is re-enabled here (protocol-v2 §二.5).
+    private func handleExternalScreenDidConnect() {
+        guard #available(iOS 27.0, *) else {
+            // iOS < 27: only the classic multiple-display path exists.
+            if attachLegacyExternalScreenIfAvailable() {
+                resolvePendingStartIfPossible()
+            }
+            return
+        }
+        guard let registration = registeredAccessory else {
+            arLog("external screen connected but the accessory is not registered yet")
+            return
+        }
+        if !registration.isEnabled {
+            registration.isEnabled = true
+            arLog("external screen connected while start pending: accessory re-enabled")
+        } else {
+            arLog("external screen connected: accessory enabled, pending=\(startPendingResult != nil)")
+        }
+    }
+
+    /// The legacy `UIScreen` fallback lost its display; the accessory scene path is unaffected.
+    private func handleLegacyExternalScreenDisconnected() {
+        let wasConnected = isDisplayConnected
+        if startPendingResult != nil {
+            flushPendingStart(failureMessage: "外接屏已断开")
+        }
+        if player != nil {
+            teardownPlayback()
+        }
+        closeLegacyExternalWindow()
+        if wasConnected {
+            sendEvent(["type": "disconnected"])
         }
     }
 
@@ -504,7 +699,7 @@ final class ARDisplayManager: NSObject {
     private func handleStop(result: @escaping FlutterResult) {
         let positionMs = currentPositionMilliseconds()
         let durationMs = currentDurationMilliseconds()
-        teardownPlayback(keepingExternalDisplay: false)
+        teardownPlayback()
         result([
             "positionMs": positionMs,
             "durationMs": durationMs,
@@ -531,6 +726,8 @@ final class ARDisplayManager: NSObject {
         } else {
             player.play()
         }
+        // A replay after playback-end / a `play` from the remote page: leave the idle page.
+        displayViewController?.showIdleState(false)
         displayViewController?.setDanmakuPaused(false)
     }
 
@@ -544,13 +741,16 @@ final class ARDisplayManager: NSObject {
 
     private func attachPlayerToExternalDisplay() {
         guard let viewController = displayViewController, let player = player else { return }
+        // Re-assert the window at start time too: the scene can be connected while the system
+        // is still mirroring the phone (the `windowVisible` diagnostic covers this case).
+        assertExternalWindowVisible()
         viewController.attach(player: player)
         viewController.configureDanmaku(
             items: danmakuItems,
             enabled: danmakuEnabled,
-            opacity: danmakuOpacity,
-            fontScale: danmakuFontScale
+            config: danmakuConfig
         )
+        viewController.showIdleState(false)
         applySeek(toMilliseconds: pendingStartPositionMilliseconds)
         startPlayback()
         sendStateEvent()
@@ -564,10 +764,21 @@ final class ARDisplayManager: NSObject {
             sceneDelegate.closeWindow()
             return
         }
+        // If the legacy `UIScreen` fallback was hosting the player, hand the display over to
+        // the accessory scene's window (it is the primary path and is now connected).
+        if legacyExternalWindow != nil {
+            arLog("accessory scene connected: closing the legacy external window")
+            legacyExternalWindow?.isHidden = true
+            legacyExternalWindow?.rootViewController = nil
+            legacyExternalWindow = nil
+        }
         self.sceneDelegate = sceneDelegate
         self.externalWindowScene = windowScene
         self.displayViewController = sceneDelegate.playerViewController
         isDisplayConnected = true
+        isKickInProgress = false
+        startKickWorkItem?.cancel()
+        startKickWorkItem = nil
         updateScreenMetrics(from: windowScene)
         sendEvent([
             "type": "connected",
@@ -582,7 +793,12 @@ final class ARDisplayManager: NSObject {
             self.assertExternalWindowVisible()
             self.sendStateEvent()
         }
+        // A player may already exist (a `start` waiting for this scene, or a reconnect while
+        // playing); otherwise the glasses show the idle page.
         attachPlayerToExternalDisplay()
+        if player == nil, let viewController = displayViewController {
+            viewController.showIdleState(true)
+        }
         resolvePendingStartIfPossible()
     }
 
@@ -594,12 +810,42 @@ final class ARDisplayManager: NSObject {
         screenWidth = 0
         screenHeight = 0
         isDisplayConnected = false
+        // This disconnect was caused by our own `isEnabled=false -> true` kick: the system is
+        // re-presenting the accessory. Keep the pending `start` and the player so the fresh
+        // scene can attach them again (a real unplug still ends via the start timeout).
+        if isKickInProgress {
+            arLog("external scene disconnected during an accessory kick; keeping the session")
+            return
+        }
+        startKickWorkItem?.cancel()
+        startKickWorkItem = nil
+        accessoryKickWorkItem?.cancel()
+        accessoryKickWorkItem = nil
+        // The scene (and its window) is gone: a pending `start` can never succeed and the
+        // player cannot be shown anywhere, so both are torn down exactly once here.
+        if startPendingResult != nil {
+            flushPendingStart(failureMessage: "外接屏已断开，请确认眼镜已用 USB‑C 连接")
+        }
+        if player != nil {
+            teardownPlayback()
+        }
         if wasConnected {
             sendEvent(["type": "disconnected"])
         }
-        if player != nil || startPendingResult != nil {
-            teardownPlayback(keepingExternalDisplay: false)
+    }
+
+    /// Called from `ARDisplaySceneDelegate.sceneDidBecomeActive`.
+    ///
+    /// Re-asserts the window (some systems need it after the phone was locked or the accessory
+    /// was re-presented) and refreshes the reported metrics without re-sending `connected`.
+    func handleExternalSceneBecameActive(windowScene: UIWindowScene) {
+        guard let currentScene = externalWindowScene, currentScene === windowScene else { return }
+        updateScreenMetrics(from: windowScene)
+        assertExternalWindowVisible()
+        if player == nil {
+            displayViewController?.showIdleState(true)
         }
+        arLog("external scene became active: windowVisible=\(isExternalWindowVisible())")
     }
 
     /// Whether our external-display window is actually on screen (not just created).
@@ -615,11 +861,12 @@ final class ARDisplayManager: NSObject {
 
     private func assertExternalWindowVisible() {
         if let window = sceneDelegate?.window {
-            if window.isHidden || window.windowScene == nil {
+            let needsPresentation = window.isHidden || window.windowScene == nil
+            if needsPresentation {
                 window.isHidden = false
-            }
-            if !window.isKeyWindow {
-                window.makeKey()
+                if !window.isKeyWindow {
+                    window.makeKey()
+                }
             }
         } else if let window = legacyExternalWindow, window.isHidden {
             window.isHidden = false
@@ -678,46 +925,69 @@ final class ARDisplayManager: NSObject {
             sceneConfiguration: configuration
         )
         let registration = hostViewController.registerSceneAccessory(accessory)
+        // Start enabled: the system only hands the external-display scene to accessories that
+        // are already enabled when the display (or the app) comes up.
+        registration.isEnabled = true
         registeredAccessory = registration
         accessoryHostViewController = hostViewController
         startObservingExternalScreens()
+        arLog("accessory registered, available=\(registration.isAvailable)")
         return true
+    }
+
+    /// Toggles `isEnabled` off/on to make the system re-evaluate presenting the accessory.
+    /// Needed when the external display was already mirroring when the accessory got enabled.
+    ///
+    /// The accessory registration itself is permanent: after the gap it is always re-enabled.
+    private func kickAccessoryPresentation() {
+        guard #available(iOS 27.0, *) else { return }
+        guard let registration = registeredAccessory, !isDisplayConnected else { return }
+        registration.isEnabled = false
+        isKickInProgress = true
+        accessoryKickWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            arRunOnMainActor {
+                guard let self = self else { return }
+                guard #available(iOS 27.0, *) else { return }
+                self.registeredAccessory?.isEnabled = true
+                self.isKickInProgress = false
+                self.accessoryKickWorkItem = nil
+                arLog("accessory presentation kick applied (isEnabled=true)")
+            }
+        }
+        accessoryKickWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + ARDisplayManager.accessoryKickGapSeconds,
+            execute: workItem
+        )
     }
 
     @available(iOS 27.0, *)
     private func setAccessoryEnabled(_ enabled: Bool) {
         guard let registration = registeredAccessory else { return }
-        registration.isEnabled = enabled
-    }
-
-    private func unregisterAccessoryRegistration() {
-        if #available(iOS 27.0, *) {
-            if let registration = registeredAccessory {
-                registration.isEnabled = false
-                if let hostViewController = accessoryHostViewController {
-                    hostViewController.unregisterSceneAccessory(registration)
-                } else {
-                    arLog("accessory host view controller is gone; registration dropped")
-                }
-            }
-            registeredAccessory = nil
+        if registration.isEnabled != enabled {
+            registration.isEnabled = enabled
         }
-        accessoryHostViewController = nil
     }
 
     // MARK: - Teardown
 
-    /// Tears down the AVPlayer session.
+    /// Tears down the AVPlayer session but keeps the external window + accessory registration
+    /// alive (the glasses switch to the idle page and the next `start` is immediate).
     ///
-    /// - Parameter keepingExternalDisplay: `true` keeps the registered accessory and the
-    ///   glasses window alive (used by a second `start`); `false` also unregisters the
-    ///   accessory, closes the window and reports `disconnected` to Dart.
-    private func teardownPlayback(keepingExternalDisplay: Bool) {
+    /// The accessory is never unregistered and never disabled here: the device only presents
+    /// the glasses scene to an accessory that was enabled *before* the display connected, so
+    /// tearing it down on `stop` would break the next projection.
+    private func teardownPlayback() {
         guard !isTearingDown else { return }
         isTearingDown = true
         defer { isTearingDown = false }
 
         flushPendingStart(failureMessage: "播放已停止")
+        startTimeoutWorkItem?.cancel()
+        startTimeoutWorkItem = nil
+        startKickWorkItem?.cancel()
+        startKickWorkItem = nil
 
         removePlayerObservers()
         if let player = player {
@@ -726,37 +996,41 @@ final class ARDisplayManager: NSObject {
         }
         player = nil
         playerItem = nil
+        releaseLocalPlaybackResources()
         playbackEnded = false
         lastKnownError = nil
         playbackSpeed = 1.0
         pendingStartPositionMilliseconds = 0
         danmakuItems = []
 
+        // Keep the external window and the accessory registration alive: the glasses switch to
+        // the idle page and the next `start` is available immediately (no mirroring in between).
         if let viewController = displayViewController {
             viewController.attach(player: nil)
-            viewController.configureDanmaku(items: [], enabled: danmakuEnabled, opacity: danmakuOpacity, fontScale: danmakuFontScale)
+            viewController.configureDanmaku(items: [], enabled: danmakuEnabled, config: danmakuConfig)
+            viewController.showIdleState(true)
         }
+    }
 
-        if keepingExternalDisplay {
-            return
-        }
+    /// Drops the strong references that kept a local HLS resource loader / asset alive.
+    private func releaseLocalPlaybackResources() {
+        localHLSAsset?.resourceLoader.setDelegate(nil, queue: nil)
+        localHLSAsset = nil
+        localResourceLoaderDelegate = nil
+        isLocalPlaybackSession = false
+        isLocalHLSSession = false
+    }
 
-        if let window = legacyExternalWindow {
-            window.isHidden = true
-            window.rootViewController = nil
-            legacyExternalWindow = nil
-        }
-        displayViewController = nil
-        sceneDelegate?.closeWindow()
-        sceneDelegate = nil
-        externalWindowScene = nil
+    /// Closes the legacy `UIScreen` fallback window (the accessory scene path keeps its window).
+    private func closeLegacyExternalWindow() {
+        legacyExternalWindow?.isHidden = true
+        legacyExternalWindow?.rootViewController = nil
+        legacyExternalWindow = nil
         screenWidth = 0
         screenHeight = 0
-        unregisterAccessoryRegistration()
-
-        if isDisplayConnected {
+        if sceneDelegate == nil {
+            displayViewController = nil
             isDisplayConnected = false
-            sendEvent(["type": "disconnected"])
         }
     }
 
@@ -859,12 +1133,20 @@ final class ARDisplayManager: NSObject {
         playbackEnded = true
         displayViewController?.setDanmakuPaused(true)
         displayViewController?.stopDanmaku()
+        // Playback finished: the glasses go back to the idle page (the external window and the
+        // accessory registration stay alive for the next `start`).
+        displayViewController?.showIdleState(true)
         sendStateEvent()
     }
 
     private func handlePlaybackFailed(message: String?) {
         guard player != nil else { return }
-        let text = message ?? playerItem?.error?.localizedDescription ?? "视频播放失败"
+        var text = message ?? playerItem?.error?.localizedDescription ?? "视频播放失败"
+        if isLocalPlaybackSession && !isLocalHLSSession {
+            // AVPlayer cannot decode this local container: report the documented message
+            // instead of a generic AVFoundation error.
+            text = "该本地视频格式不支持投放"
+        }
         lastKnownError = text
         sendEvent(["type": "error", "message": text])
         sendStateEvent()
@@ -975,16 +1257,130 @@ final class ARDisplayManager: NSObject {
 
     // MARK: - Payload parsing
 
-    private static func makePlayerItem(url: URL, headers: [String: String]) -> AVPlayerItem {
-        let asset: AVURLAsset
-        if headers.isEmpty {
-            asset = AVURLAsset(url: url)
-        } else {
-            // `AVURLAssetHTTPHeaderFieldsKey` is a private-but-widely-used AVFoundation key;
-            // the app already relies on it in `openVideoWithReferer`.
-            asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+    /// A validated `start` media source.
+    private enum ARStartSource {
+        /// Network URL played directly with the custom HTTP headers.
+        case remote(url: URL, headers: [String: String])
+        /// Single local file (`mp4` / `mov` / `m4v` / ...), played from a plain `file://` URL.
+        case localFile(fileURL: URL)
+        /// Local HLS playlist; served through `ARLocalHLSResourceLoader`.
+        case localHLS(playlistURL: URL)
+    }
+
+    /// Validates the `start` arguments without touching the current session.
+    ///
+    /// Keys read from the payload: `url`, `headers`, `isLocalFile` (the rest of `start` is read
+    /// by `handleStart`). When `isLocalFile` is true `url` is a filesystem path (an optional
+    /// `file://` prefix is stripped); it is never sent through the network path.
+    private static func resolveStartSource(
+        urlString: String,
+        headers rawHeaders: Any?,
+        isLocalFile: Bool
+    ) -> (source: ARStartSource?, error: String?) {
+        if !isLocalFile {
+            let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty,
+                  let url = URL(string: trimmed),
+                  let scheme = url.scheme,
+                  !scheme.isEmpty
+            else {
+                return (nil, "视频地址无效")
+            }
+            return (.remote(url: url, headers: headerFields(from: rawHeaders)), nil)
         }
-        return AVPlayerItem(asset: asset)
+
+        let path = localFilePath(from: urlString)
+        guard !path.isEmpty else { return (nil, "本地视频文件不存在") }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else {
+            return (nil, "本地视频文件不存在")
+        }
+        let fileURL = URL(fileURLWithPath: path)
+        let pathExtension = fileURL.pathExtension.lowercased()
+        if pathExtension == "m3u8" || pathExtension == "m3u" {
+            // AVPlayer cannot open a local playlist directly: serve it (and its sibling
+            // segments) through the custom scheme below.
+            return (.localHLS(playlistURL: fileURL), nil)
+        }
+        if unsupportedLocalFileExtensions.contains(pathExtension) {
+            return (nil, "该本地视频格式不支持投放")
+        }
+        return (.localFile(fileURL: fileURL), nil)
+    }
+
+    /// Builds the `AVPlayerItem` for a validated source.
+    ///
+    /// Local single files use a plain `file://` URL; local HLS playlists are re-served under
+    /// `kazumi-local://local/<playlist.m3u8>` so AVFoundation asks the resource loader for both
+    /// the playlist and the sibling `seg_*.ts` files. Network sources keep the HTTP headers.
+    private func makePlayerItem(for source: ARStartSource) -> AVPlayerItem? {
+        releaseLocalPlaybackResources()
+        switch source {
+        case .remote(let url, let headers):
+            isLocalPlaybackSession = false
+            isLocalHLSSession = false
+            let asset: AVURLAsset
+            if headers.isEmpty {
+                asset = AVURLAsset(url: url)
+            } else {
+                // `AVURLAssetHTTPHeaderFieldsKey` is a private-but-widely-used AVFoundation
+                // key; the app already relies on it in `openVideoWithReferer`.
+                asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+            }
+            return AVPlayerItem(asset: asset)
+
+        case .localFile(let fileURL):
+            isLocalPlaybackSession = true
+            isLocalHLSSession = false
+            arLog("local file playback: \(fileURL.lastPathComponent)")
+            return AVPlayerItem(asset: AVURLAsset(url: fileURL))
+
+        case .localHLS(let playlistURL):
+            isLocalPlaybackSession = true
+            isLocalHLSSession = true
+            var components = URLComponents()
+            components.scheme = ARLocalHLSResourceLoader.customScheme
+            components.host = ARLocalHLSResourceLoader.customHost
+            components.path = "/" + playlistURL.lastPathComponent
+            guard let customURL = components.url else { return nil }
+            let loader = ARLocalHLSResourceLoader(
+                directory: playlistURL.deletingLastPathComponent()
+            )
+            let asset = AVURLAsset(url: customURL)
+            asset.resourceLoader.setDelegate(
+                loader,
+                queue: DispatchQueue.global(qos: .userInitiated)
+            )
+            localResourceLoaderDelegate = loader
+            localHLSAsset = asset
+            arLog("local HLS playback: \(playlistURL.lastPathComponent)")
+            return AVPlayerItem(asset: asset)
+        }
+    }
+
+    /// Turns the Dart `url` of a local file into an absolute filesystem path.
+    ///
+    /// Dart is expected to send a bare path, but a `file://` prefixed value is accepted too
+    /// (protocol-v2 §五). Percent-encoded values are decoded only when they came as a file URL.
+    private static func localFilePath(from raw: String) -> String {
+        var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercased = value.lowercased()
+        if lowercased.hasPrefix("file://") {
+            if let url = URL(string: value) {
+                return url.path
+            }
+            value = String(value.dropFirst("file://".count))
+            if value.lowercased().hasPrefix("localhost/") {
+                value = String(value.dropFirst("localhost".count))
+            }
+            return value
+        }
+        if lowercased.hasPrefix("file:") {
+            value = String(value.dropFirst("file:".count))
+        }
+        return value
     }
 
     private static func headerFields(from value: Any?) -> [String: String] {
@@ -1021,6 +1417,22 @@ final class ARDisplayManager: NSObject {
         return items
     }
 
+    /// Parses the v2 `danmakuConfig` payload into the overlay's `ARDanmakuConfig` struct.
+    ///
+    /// The struct itself is tolerant (missing / mistyped keys fall back to its defaults), so
+    /// the manager only needs to forward the dictionary. The v1 `danmakuOpacity` /
+    /// `danmakuFontSize` keys are folded in as a fallback for callers that still send them.
+    private static func parseDanmakuConfig(_ payload: [String: Any]) -> ARDanmakuConfig {
+        var rawConfig = payload["danmakuConfig"] as? [String: Any] ?? [:]
+        if rawConfig["opacity"] == nil, let legacyOpacity = doubleValue(payload["danmakuOpacity"]) {
+            rawConfig["opacity"] = legacyOpacity
+        }
+        if rawConfig["fontScale"] == nil, let legacyFontSize = doubleValue(payload["danmakuFontSize"]) {
+            rawConfig["fontScale"] = legacyFontSize
+        }
+        return ARDanmakuConfig(payload: rawConfig)
+    }
+
     private static func doubleValue(_ value: Any?) -> Double? {
         if let number = value as? Double { return number }
         if let number = value as? Int { return Double(number) }
@@ -1037,5 +1449,148 @@ final class ARDisplayManager: NSObject {
 
     private static func startFailure(_ message: String) -> [String: Any] {
         return ["ok": false, "error": message]
+    }
+}
+
+// MARK: - Local HLS resource loader
+
+/// Serves a locally downloaded HLS playlist and its segments to AVPlayer.
+///
+/// `AVPlayer` cannot open a local `.m3u8` file directly, so the asset is created with a custom
+/// scheme (`kazumi-local://local/<playlist.m3u8>`) and every playlist / segment request is
+/// resolved to the file with the same name inside the playlist's directory. The playlist uses
+/// relative file names (`seg_000.ts`), which AVFoundation resolves against the custom base URL,
+/// so `request.url.lastPathComponent` is exactly the name to look up.
+///
+/// The delegate must be retained by the caller for as long as the asset is in use (the
+/// resource loader holds it weakly); `ARDisplayManager` keeps it in
+/// `localResourceLoaderDelegate` and drops it in `releaseLocalPlaybackResources()`.
+final class ARLocalHLSResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
+
+    /// Custom URL scheme for locally served HLS. Not registered with the system on purpose:
+    /// AVFoundation only routes *unknown* schemes to the resource loader delegate.
+    static let customScheme = "kazumi-local"
+    static let customHost = "local"
+
+    private let directory: URL
+
+    init(directory: URL) {
+        self.directory = directory
+        super.init()
+    }
+
+    // MARK: - AVAssetResourceLoaderDelegate
+
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
+    ) -> Bool {
+        guard let requestURL = loadingRequest.request.url,
+              requestURL.scheme?.lowercased() == ARLocalHLSResourceLoader.customScheme
+        else {
+            return false
+        }
+
+        // `lastPathComponent` also guards against path traversal (`../` never survives it).
+        let fileName = requestURL.lastPathComponent
+        guard !fileName.isEmpty else {
+            finish(loadingRequest, errorCode: NSURLErrorBadURL, description: "本地视频分片地址无效")
+            return true
+        }
+        let fileURL = directory.appendingPathComponent(fileName)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            arLog("local HLS: missing file \(fileName)")
+            finish(loadingRequest, errorCode: NSURLErrorFileDoesNotExist, description: "本地视频分片不存在")
+            return true
+        }
+        guard let data = try? Data(contentsOf: fileURL, options: [.mappedIfSafe]) else {
+            arLog("local HLS: cannot read file \(fileName)")
+            finish(loadingRequest, errorCode: NSURLErrorCannotOpenFile, description: "本地视频文件无法读取")
+            return true
+        }
+
+        if let contentInformation = loadingRequest.contentInformationRequest {
+            contentInformation.contentType = ARLocalHLSResourceLoader.contentType(
+                forPathExtension: fileURL.pathExtension
+            )
+            contentInformation.contentLength = Int64(data.count)
+            contentInformation.isByteRangeAccessSupported = true
+        }
+
+        if let dataRequest = loadingRequest.dataRequest {
+            respond(dataRequest, with: data)
+        }
+        loadingRequest.finishLoading()
+        return true
+    }
+
+    func resourceLoader(
+        _ resourceLoader: AVAssetResourceLoader,
+        didCancel loadingRequest: AVAssetResourceLoadingRequest
+    ) {
+        // Every response is produced synchronously, so there is nothing to cancel.
+    }
+
+    // MARK: - Helpers
+
+    /// Answers one byte-range data request (plain, ranged or "to end of resource").
+    private func respond(_ dataRequest: AVAssetResourceLoadingDataRequest, with data: Data) {
+        let totalLength = data.count
+        let requestedOffset = dataRequest.requestedOffset
+        guard requestedOffset >= 0 else { return }
+        let offset = Int(requestedOffset)
+        guard offset < totalLength else { return }
+
+        let end: Int
+        if dataRequest.requestsAllDataToEndOfResource {
+            end = totalLength
+        } else {
+            let requestedEnd = offset + dataRequest.requestedLength
+            end = min(totalLength, max(offset, requestedEnd))
+        }
+        guard end > offset else { return }
+        dataRequest.respond(with: data.subdata(in: offset..<end))
+    }
+
+    private func finish(
+        _ loadingRequest: AVAssetResourceLoadingRequest,
+        errorCode: Int,
+        description: String
+    ) {
+        loadingRequest.finishLoading(
+            with: NSError(
+                domain: NSURLErrorDomain,
+                code: errorCode,
+                userInfo: [NSLocalizedDescriptionKey: description]
+            )
+        )
+    }
+
+    /// MIME type reported to AVFoundation for a served file.
+    ///
+    /// `.ts` uses `video/mp2t` (the value AVFoundation expects for MPEG-2 transport streams);
+    /// `public.mp2t` is the UTI equivalent kept here as a fallback reference — switching to it
+    /// is a one-line change if a specific iOS build rejects the MIME type.
+    private static func contentType(forPathExtension pathExtension: String) -> String {
+        switch pathExtension.lowercased() {
+        case "m3u8", "m3u":
+            return "application/vnd.apple.mpegurl"
+        case "ts", "m2ts":
+            return "video/mp2t"
+        case "m4s":
+            return "video/iso.segment"
+        case "mp4", "m4v", "mov":
+            return "video/mp4"
+        case "aac":
+            return "audio/aac"
+        case "mp3":
+            return "audio/mpeg"
+        case "key", "bin", "dat":
+            // HLS encryption key / auxiliary data.
+            return "application/octet-stream"
+        default:
+            // Extension-less segments are MPEG-TS in every local-HLS download we produce.
+            return "video/mp2t"
+        }
     }
 }
