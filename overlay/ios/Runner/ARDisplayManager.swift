@@ -1023,6 +1023,7 @@ final class ARDisplayManager: NSObject {
             viewController.configureDanmaku(items: [], enabled: danmakuEnabled, config: danmakuConfig)
             viewController.showIdleState(true)
         }
+        deactivateAudioSessionIfNeeded()
     }
 
     /// Drops the strong references that kept a local HLS resource loader / asset alive.
@@ -1217,6 +1218,22 @@ final class ARDisplayManager: NSObject {
         } catch {
             // Not fatal: the glasses may still show the video even if audio routing fails.
             arLog("audio session setup failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Releases the AVAudioSession we activated for external playback.
+    ///
+    /// Without this the session stays active/owned by the `.moviePlayback` configuration, and
+    /// the phone-side media_kit / audio_service re-initialisation after "结束投屏" could hang at
+    /// "播放器加载中".
+    private func deactivateAudioSessionIfNeeded() {
+        let session = AVAudioSession.sharedInstance()
+        do {
+            try session.setCategory(.playback, mode: .default, options: [])
+            try session.setActive(false, options: [.notifyOthersOnDeactivation])
+            logStep("audio session released")
+        } catch {
+            arLog("audio session release failed: \(error.localizedDescription)")
         }
     }
 
