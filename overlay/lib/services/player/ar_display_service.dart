@@ -56,6 +56,10 @@ class ARDisplayService {
     if (!Platform.isIOS) {
       return const ARDisplayStartResult.failed('当前平台不支持 AR 眼镜播放');
     }
+    KazumiLogger().i(
+      'ARDisplayService: start url=${isLocalFile ? 'local' : 'remote'} '
+      'pos=${positionMs}ms danmaku=${danmaku.length}',
+    );
     final map = await _invokeMap('start', <String, Object?>{
       'url': url,
       'headers': headers,
@@ -67,10 +71,19 @@ class ARDisplayService {
       ],
       'danmakuEnabled': danmakuEnabled,
       'danmakuConfig': danmakuConfig,
-    });
+    }).timeout(
+      const Duration(seconds: 12),
+      onTimeout: () {
+        KazumiLogger().e('ARDisplayService: native start timed out (12s)');
+        return null;
+      },
+    );
     if (map == null) {
-      return const ARDisplayStartResult.failed('AR 眼镜投屏启动失败');
+      return const ARDisplayStartResult.failed('AR 眼镜投屏启动超时');
     }
+    KazumiLogger().i(
+      'ARDisplayService: start reply ok=${map['ok']} error=${map['error']}',
+    );
     return ARDisplayStartResult(
       ok: map['ok'] == true,
       error: _asOptionalString(map['error']),
@@ -153,6 +166,11 @@ class ARDisplayService {
   }
 
   static void _handleNativeEvent(dynamic event) {
+    if (event is Map && event['type'] == 'log') {
+      // Native diagnostics are surfaced in the app log page ("设置 → 日志").
+      KazumiLogger().i('[AR native] ${event['message']}');
+      return;
+    }
     final ARDisplayEvent? decoded = _decodeEvent(event);
     if (decoded != null) {
       _eventController.add(decoded);
@@ -201,9 +219,14 @@ class ARDisplayService {
     Map<String, Object?>? arguments,
   ]) async {
     try {
-      return await _methodChannel.invokeMethod<Map<Object?, Object?>>(
-        method,
-        arguments,
+      return await _methodChannel
+          .invokeMethod<Map<Object?, Object?>>(method, arguments)
+          .timeout(
+        const Duration(seconds: 10),
+        onTimeout: () {
+          KazumiLogger().e('ARDisplayService: $method timed out (10s)');
+          return null;
+        },
       );
     } on MissingPluginException catch (error) {
       KazumiLogger()

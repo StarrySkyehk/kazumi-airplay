@@ -106,6 +106,8 @@ class _PlayerItemState extends State<PlayerItem>
   static const double _arDanmakuFontScaleMax = 3.0;
   bool _arDisplayInProgress = false;
   bool _arConnectingDialogVisible = false;
+  bool _arConnectingCancelled = false;
+  Future<void>? _arReleaseFuture;
 
   late double _danmakuArea;
   late bool _hideTop;
@@ -1199,20 +1201,22 @@ class _PlayerItemState extends State<PlayerItem>
     };
   }
 
-  /// 连接外接屏可能耗时（等系统创建外接屏场景），期间给用户一个不可取消的提示。
+  /// 连接外接屏可能耗时（等系统创建外接屏场景 / 原生播放器起播），期间给用户
+  /// 一个可取消的提示，取消后回落到手机播放。
   void _showArConnectingDialog() {
     if (_arConnectingDialogVisible || !mounted) {
       return;
     }
     _arConnectingDialogVisible = true;
+    _arConnectingCancelled = false;
     showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (BuildContext dialogContext) {
-        return const PopScope(
+        return PopScope(
           canPop: false,
           child: AlertDialog(
-            content: Row(
+            content: const Row(
               children: <Widget>[
                 SizedBox(
                   width: 22,
@@ -1223,6 +1227,15 @@ class _PlayerItemState extends State<PlayerItem>
                 Expanded(child: Text('正在连接 AR 眼镜…')),
               ],
             ),
+            actions: <Widget>[
+              TextButton(
+                onPressed: () {
+                  _arConnectingCancelled = true;
+                  _hideArConnectingDialog();
+                },
+                child: const Text('取消'),
+              ),
+            ],
           ),
         );
       },
@@ -1239,8 +1252,8 @@ class _PlayerItemState extends State<PlayerItem>
     Navigator.of(context, rootNavigator: true).pop();
   }
 
-  /// 彻底释放手机端播放（mpv 与网络/磁盘缓存）后交给原生 AVPlayer，成功后
-  /// 进入手机遥控页；退出时回传原生位置并重建 mpv。
+  /// 把手机关联的 mpv 在后台彻底释放（停网络/磁盘缓存）后交给原生 AVPlayer。
+  /// 释放不阻塞连接流程：超时或失败只记日志，不影响投屏本身。
   Future<void> _startArDisplay() async {
     if (!Platform.isIOS) {
       return;
@@ -1266,18 +1279,26 @@ class _PlayerItemState extends State<PlayerItem>
         : videoPageController.title;
     final List<ARDisplayDanmakuItem> danmaku = _buildArDisplayDanmaku();
     final Map<String, Object?> danmakuConfig = _buildArDanmakuConfig();
-    // 暂停期间停掉每秒同步：否则 paused 的 media_kit 状态会写入 audio_service
-    // 并释放原生播放需要的 AVAudioSession，同时还会为空转的进度发弹幕。
     playerTimer?.cancel();
     _showArConnectingDialog();
+    KazumiLogger().i(
+      'AR: begin handoff position=${startPositionMs}ms '
+      'duration=${durationMs}ms playing=$resumePlayback '
+      'danmaku=${danmaku.length}',
+    );
     try {
-      await playerController.pause();
-      // AR 期间手机上不允许再有第二路解码/缓存：先彻底释放 mpv。
-      final bool released =
-          await playerController.releasePlaybackForExternalDisplay();
-      if (!released) {
-        throw StateError('failed to release the mobile playback resources');
+      await _arPauseForHandoff();
+      if (_arConnectingCancelled) {
+        KazumiLogger().i('AR: cancelled before native start');
+        await _resumeAfterArDisplay(
+          positionMs: startPositionMs,
+          resumePlayback: resumePlayback,
+        );
+        return;
       }
+      KazumiLogger().i('AR: releasing mobile playback in background');
+      _arReleaseFuture = _releaseMobilePlaybackForHandoff();
+      KazumiLogger().i('AR: calling native start');
       final ARDisplayStartResult startResult = await ARDisplayService.start(
         url: playerController.videoUrl,
         headers: playerController.httpHeaders,
@@ -1288,10 +1309,22 @@ class _PlayerItemState extends State<PlayerItem>
         danmakuEnabled: playerController.danmaku.danmakuOn,
         danmakuConfig: danmakuConfig,
       );
+      KazumiLogger().i(
+        'AR: native start returned ok=${startResult.ok} '
+        'error=${startResult.error ?? ''}',
+      );
       _hideArConnectingDialog();
       if (!mounted) {
-        // 播放页已销毁：别让原生侧留下无人控制的播放。
         unawaited(ARDisplayService.stop());
+        return;
+      }
+      if (_arConnectingCancelled) {
+        KazumiLogger().i('AR: cancelled after native start');
+        await ARDisplayService.stop();
+        await _resumeAfterArDisplay(
+          positionMs: startPositionMs,
+          resumePlayback: resumePlayback,
+        );
         return;
       }
       if (!startResult.ok) {
@@ -1301,16 +1334,23 @@ class _PlayerItemState extends State<PlayerItem>
         KazumiDialog.showToast(
           message: startResult.error ?? 'AR 眼镜投屏启动失败',
         );
-        // mpv 已被释放，必须按投屏起点重建（不能沿用旧的 mpv 位置）。
+        // 原生若在超时后才真正起播，这里兜底停掉，避免两端同时出声。
+        try {
+          await ARDisplayService.stop();
+        } catch (error, stackTrace) {
+          KazumiLogger().w(
+            'AR: stop after failed start threw',
+            error: error,
+            stackTrace: stackTrace,
+          );
+        }
         await _resumeAfterArDisplay(
           positionMs: startPositionMs,
           resumePlayback: resumePlayback,
         );
         return;
       }
-      KazumiLogger().i(
-        'PlayerItem: AR display started, danmaku items: ${danmaku.length}',
-      );
+      KazumiLogger().i('AR: remote page opening');
       final int? endPositionMs = await Navigator.of(context).push<int>(
         MaterialPageRoute<int>(
           fullscreenDialog: true,
@@ -1324,10 +1364,10 @@ class _PlayerItemState extends State<PlayerItem>
           ),
         ),
       );
+      KazumiLogger().i('AR: remote page closed, endPosition=$endPositionMs');
       if (!mounted) {
         return;
       }
-      // 原生没回传可信位置时退回到投屏起点，避免从 0 重新缓冲。
       await _resumeAfterArDisplay(
         positionMs: endPositionMs ?? startPositionMs,
         resumePlayback: resumePlayback,
@@ -1338,7 +1378,6 @@ class _PlayerItemState extends State<PlayerItem>
         error: error,
         stackTrace: stackTrace,
       );
-      // 走到这里说明投屏未能正常建立，避免原生侧留下孤儿播放。
       await ARDisplayService.stop();
       if (mounted) {
         KazumiDialog.showToast(message: 'AR 眼镜投屏失败，请重试');
@@ -1350,6 +1389,45 @@ class _PlayerItemState extends State<PlayerItem>
     } finally {
       _hideArConnectingDialog();
       _arDisplayInProgress = false;
+      KazumiLogger().i('AR: handoff flow finished');
+    }
+  }
+
+  Future<void> _arPauseForHandoff() async {
+    try {
+      await playerController.pause().timeout(const Duration(seconds: 3));
+    } on TimeoutException {
+      KazumiLogger().w('AR: pause timed out, continuing');
+    } catch (error, stackTrace) {
+      KazumiLogger().w('AR: pause failed', error: error, stackTrace: stackTrace);
+    }
+  }
+
+  Future<void> _releaseMobilePlaybackForHandoff() async {
+    try {
+      final bool released = await playerController
+          .releasePlaybackForExternalDisplay()
+          .timeout(const Duration(seconds: 12), onTimeout: () => false);
+      KazumiLogger().i('AR: mobile playback released=$released');
+    } catch (error, stackTrace) {
+      KazumiLogger().w(
+        'AR: release of mobile playback failed',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+  }
+
+  Future<void> _awaitArPlaybackRelease() async {
+    final Future<void>? release = _arReleaseFuture;
+    _arReleaseFuture = null;
+    if (release == null) {
+      return;
+    }
+    try {
+      await release.timeout(const Duration(seconds: 6));
+    } on TimeoutException {
+      KazumiLogger().w('AR: waiting for playback release timed out');
     }
   }
 
@@ -1362,6 +1440,8 @@ class _PlayerItemState extends State<PlayerItem>
     if (!mounted) {
       return;
     }
+    // 等投屏前发起的后台释放收尾，避免它和重建播放互相抢 mpv 状态。
+    await _awaitArPlaybackRelease();
     // 原生期间的进度与手机端暂停前的画面无关，先清屏避免恢复后残留旧弹幕。
     try {
       playerController.danmaku.clearAndInvalidateScheduledDanmakus();

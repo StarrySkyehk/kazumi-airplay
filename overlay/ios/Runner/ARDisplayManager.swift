@@ -245,6 +245,15 @@ final class ARDisplayManager: NSObject {
         }
     }
 
+    /// Logs a step to the device console *and* forwards it to Dart so it shows up in the
+    /// in-app log page ("设置 → 日志") for on-device diagnostics.
+    private func logStep(_ message: String) {
+        arLog(message)
+        if let sink = eventSinkBox.eventSink {
+            sink(["type": "log", "message": message])
+        }
+    }
+
     /// Replays the current state when Dart (re)starts listening on the event channel.
     ///
     /// Called by `ARDisplayEventRelay.onListen`, which may run before any playback exists.
@@ -331,6 +340,7 @@ final class ARDisplayManager: NSObject {
             return
         }
         let isLocalFile = (payload["isLocalFile"] as? Bool) ?? false
+        logStep("start: local=\(isLocalFile) url=\(String(urlString.prefix(96)))")
 
         // Validate (and for local files: existence + format) BEFORE touching the running
         // session, so a bad request does not stop what is already on the glasses.
@@ -352,6 +362,7 @@ final class ARDisplayManager: NSObject {
         // The glasses window and the accessory registration survive: only the AVPlayer is
         // detached, so an already-connected scene is reused immediately.
         teardownPlayback()
+        logStep("start: previous session torn down")
 
         configureAudioSession()
 
@@ -362,6 +373,7 @@ final class ARDisplayManager: NSObject {
         }
         let newPlayer = AVPlayer(playerItem: item)
         newPlayer.actionAtItemEnd = .pause
+        logStep("start: player item ready")
 
         player = newPlayer
         playerItem = item
@@ -383,6 +395,7 @@ final class ARDisplayManager: NSObject {
             return
         }
         setAccessoryEnabled(true)
+        logStep("start: accessory ready connected=\(isDisplayConnected) vc=\(displayViewController != nil)")
 
         if isDisplayConnected, displayViewController != nil {
             attachPlayerToExternalDisplay()
@@ -463,7 +476,7 @@ final class ARDisplayManager: NSObject {
     private func handleStartKick() {
         startKickWorkItem = nil
         guard startPendingResult != nil, !isDisplayConnected else { return }
-        arLog("start kick: scene not connected after \(ARDisplayManager.startKickSeconds)s, toggling accessory")
+        logStep("start kick: scene not connected after \(ARDisplayManager.startKickSeconds)s, toggling accessory")
         kickAccessoryPresentation()
     }
 
@@ -561,7 +574,7 @@ final class ARDisplayManager: NSObject {
                 guard !self.isDisplayConnected,
                       let registration = self.registeredAccessory
                 else { return }
-                arLog("pre-registration kick: scene not connected (enabled=\(registration.isEnabled))")
+                logStep("pre-registration kick: scene not connected (enabled=\(registration.isEnabled))")
                 self.kickAccessoryPresentation()
             }
         }

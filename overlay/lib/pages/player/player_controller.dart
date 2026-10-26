@@ -470,6 +470,7 @@ class PlayerController implements Disposable {
   Future<bool> releasePlaybackForExternalDisplay() async {
     // 让仍在进行中的 init 失效，避免它在投屏期间重新装上一个 mpv 实例。
     _initializations.cancel();
+    KazumiLogger().i('PlayerController: releasing playback for AR display');
     try {
       await _releasePlaybackResources();
     } catch (error, stackTrace) {
@@ -480,7 +481,9 @@ class PlayerController implements Disposable {
       );
       return false;
     }
-    return playback.mediaPlayer == null;
+    final bool released = playback.mediaPlayer == null;
+    KazumiLogger().i('PlayerController: AR display release done, released=$released');
+    return released;
   }
 
   /// AR 眼镜投屏结束后重建播放。
@@ -498,9 +501,38 @@ class PlayerController implements Disposable {
       return false;
     }
     final int safePositionMs = positionMs < 0 ? 0 : positionMs;
+    KazumiLogger().i(
+      'PlayerController: resuming after AR display at ${safePositionMs}ms '
+      '(mediaPlayer=${playback.mediaPlayer != null})',
+    );
+    // mpv 仍在（投屏前的后台释放还没完成/失败）：直接 seek 恢复，不再重建播放器。
+    if (playback.mediaPlayer != null) {
+      try {
+        await seek(Duration(milliseconds: safePositionMs));
+        if (resumePlaying) {
+          await play();
+        } else {
+          await pause();
+        }
+        KazumiLogger().i('PlayerController: resumed existing player after AR');
+        return true;
+      } catch (error, stackTrace) {
+        KazumiLogger().w(
+          'PlayerController: failed to reuse existing player after AR display',
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }
+    }
     final double previousSpeed = playback.playerSpeed;
     final bool initialized = await init(
       params.copyWithOffset((safePositionMs / 1000).round()),
+    ).timeout(
+      const Duration(seconds: 25),
+      onTimeout: () {
+        KazumiLogger().e('PlayerController: rebuild after AR timed out (25s)');
+        return false;
+      },
     );
     if (!initialized) {
       _showArResumeFailureToast();
