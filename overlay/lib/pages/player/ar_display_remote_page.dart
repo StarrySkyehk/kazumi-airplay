@@ -63,6 +63,21 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
   String? _sceneState;
   bool _upscalerActive = false;
 
+  /// 播放倍速（0.5x ~ 2.0x）。
+  double _speed = 1.0;
+  /// 长按临时 2x：按住前的倍速，松手后恢复。
+  double? _heldSpeed;
+  bool _holdingFast = false;
+
+  static const List<double> _speedOptions = <double>[
+    0.5,
+    0.75,
+    1.0,
+    1.25,
+    1.5,
+    2.0,
+  ];
+
   bool get _canControl => _connected && _error == null;
 
   @override
@@ -131,6 +146,7 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
           :final windowVisible,
           :final sceneState,
           :final upscalerActive,
+          :final speed,
         ):
         setState(() {
           _playing = playing;
@@ -139,6 +155,9 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
           _windowVisible = windowVisible;
           _sceneState = sceneState;
           _upscalerActive = upscalerActive;
+          if (!_holdingFast) {
+            _speed = speed.clamp(0.5, 2.0).toDouble();
+          }
           if (durationMs > 0) {
             _durationMs = durationMs;
           }
@@ -187,6 +206,45 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
       _ended = false;
     });
     unawaited(_seek(targetMs));
+  }
+
+  Future<void> _setSpeed(double value, {bool showToast = true}) async {
+    final double target = value.clamp(0.5, 2.0).toDouble();
+    if ((target - _speed).abs() < 0.001) {
+      return;
+    }
+    final double previous = _speed;
+    setState(() => _speed = target);
+    final bool ok = await ARDisplayService.setSpeed(target);
+    if (!mounted) {
+      return;
+    }
+    if (!ok) {
+      setState(() => _speed = previous);
+      if (showToast) {
+        KazumiDialog.showToast(message: '调整倍速失败，请重试');
+      }
+    }
+  }
+
+  /// 长按状态区域：临时 2x 快进，松手恢复到长按前的倍速。
+  Future<void> _beginHoldFast() async {
+    if (!_canControl || _holdingFast) {
+      return;
+    }
+    _heldSpeed = _speed;
+    setState(() => _holdingFast = true);
+    await _setSpeed(2.0, showToast: false);
+  }
+
+  Future<void> _endHoldFast() async {
+    if (!_holdingFast) {
+      return;
+    }
+    final double restore = _heldSpeed ?? 1.0;
+    setState(() => _holdingFast = false);
+    _heldSpeed = null;
+    await _setSpeed(restore, showToast: false);
   }
 
   Future<void> _setDanmakuEnabled(bool enabled) async {
@@ -252,7 +310,19 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
                       _buildHeader(context),
                       Padding(
                         padding: const EdgeInsets.symmetric(vertical: 24),
-                        child: _buildStatus(context),
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onLongPressStart: _canControl
+                              ? (_) => unawaited(_beginHoldFast())
+                              : null,
+                          onLongPressEnd: _canControl
+                              ? (_) => unawaited(_endHoldFast())
+                              : null,
+                          onLongPressCancel: _canControl
+                              ? () => unawaited(_endHoldFast())
+                              : null,
+                          child: _buildStatus(context),
+                        ),
                       ),
                       _buildControls(),
                     ],
@@ -328,6 +398,17 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
             style: textTheme.bodySmall?.copyWith(color: Colors.white38),
           ),
         ],
+        if (_holdingFast) ...[
+          const SizedBox(height: 12),
+          Text(
+            '2× 快进中（松手恢复 ${_heldSpeed?.toStringAsFixed(2) ?? '1.0'}×）',
+            textAlign: TextAlign.center,
+            style: textTheme.bodySmall?.copyWith(
+              color: Colors.lightGreenAccent,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
         if (_buffering && _canControl) ...[
           const SizedBox(height: 16),
           const SizedBox(
@@ -383,6 +464,83 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
       detail: screenDetail,
       color: Colors.white70,
     );
+  }
+
+  Widget _buildSpeedControl(bool canControl) {
+    final bool enabled = canControl && !_holdingFast;
+    final String speedLabel = _speed.toStringAsFixed(
+      (_speed * 100).round() % 100 == 0 ? 1 : 2,
+    );
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(
+              Icons.speed_rounded,
+              color: _holdingFast ? Colors.lightGreenAccent : Colors.white70,
+            ),
+            const SizedBox(width: 12),
+            Text(
+              _holdingFast ? '2× 快进中…' : '播放倍速',
+              style: TextStyle(
+                color: _holdingFast ? Colors.lightGreenAccent : Colors.white,
+              ),
+            ),
+            const Spacer(),
+            Text(
+              '$speedLabel×',
+              style: TextStyle(
+                color: _holdingFast ? Colors.lightGreenAccent : Colors.white70,
+                fontWeight: FontWeight.w600,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 8),
+        Wrap(
+          spacing: 8,
+          runSpacing: 8,
+          children: [
+            for (final double option in _speedOptions)
+              ChoiceChip(
+                label: Text(_chipLabel(option)),
+                selected: (_speed - option).abs() < 0.001,
+                onSelected: enabled
+                    ? (_) => unawaited(_setSpeed(option))
+                    : null,
+                showCheckmark: false,
+                selectedColor: Colors.lightGreenAccent,
+                backgroundColor: Colors.white12,
+                disabledColor: Colors.white10,
+                labelStyle: TextStyle(
+                  color: (_speed - option).abs() < 0.001
+                      ? Colors.black
+                      : Colors.white70,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+                side: BorderSide(color: Colors.white24, width: 0.5),
+                visualDensity: VisualDensity.compact,
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        const Text(
+          '长按上方状态区域：临时 2× 快进，松手恢复原倍速',
+          style: TextStyle(color: Colors.white38, fontSize: 12),
+        ),
+      ],
+    );
+  }
+
+  String _chipLabel(double value) {
+    final String text = value == value.roundToDouble()
+        ? value.toStringAsFixed(1)
+        : value.toString();
+    return '${text}×';
   }
 
   Widget _buildControls() {
@@ -447,6 +605,8 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
             ),
           ),
         ),
+        const SizedBox(height: 8),
+        _buildSpeedControl(canControl),
         const SizedBox(height: 8),
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 8),

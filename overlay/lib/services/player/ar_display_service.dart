@@ -364,6 +364,7 @@ sealed class ARDisplayEvent {
           windowVisible: map['windowVisible'] != false,
           sceneState: _asOptionalString(map['sceneState']),
           upscalerActive: map['upscalerActive'] == true,
+          speed: _asDouble(map['speed'], fallback: 1.0),
         );
       case 'error':
         return ARDisplayErrorEvent(
@@ -407,6 +408,7 @@ class ARDisplayStateEvent extends ARDisplayEvent {
     this.windowVisible = true,
     this.sceneState,
     this.upscalerActive = false,
+    this.speed = 1.0,
   });
 
   final bool playing;
@@ -424,6 +426,9 @@ class ARDisplayStateEvent extends ARDisplayEvent {
 
   /// AR 端超分渲染器是否真的在出帧。
   final bool upscalerActive;
+
+  /// 当前播放倍速（原生侧的真实值）。
+  final double speed;
 }
 
 /// 致命错误（如 AVPlayerItem 失败）。
@@ -431,6 +436,16 @@ class ARDisplayErrorEvent extends ARDisplayEvent {
   const ARDisplayErrorEvent({required this.message});
 
   final String message;
+}
+
+double _asDouble(Object? value, {double fallback = 0}) {
+  if (value is num) {
+    return value.toDouble();
+  }
+  if (value is String) {
+    return double.tryParse(value) ?? fallback;
+  }
+  return fallback;
 }
 
 int _asInt(Object? value) {

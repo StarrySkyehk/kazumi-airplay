@@ -721,6 +721,7 @@ final class ARDisplayManager: NSObject {
             if let player = player, player.rate != 0 {
                 player.rate = playbackSpeed
             }
+            sendStateEvent()
         }
         result(nil)
     }
@@ -1207,6 +1208,7 @@ final class ARDisplayManager: NSObject {
             "windowVisible": isExternalWindowVisible(),
             "sceneState": externalSceneStateDescription(),
             "upscalerActive": superResolutionApplied,
+            "speed": Double(playbackSpeed),
         ]
         if let lastKnownError = lastKnownError {
             payload["error"] = lastKnownError
