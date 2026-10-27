@@ -65,6 +65,8 @@ import app_links
         // AR glasses (external display) playback: method + event channels.
         // Sibling of com.predidit.kazumi/intent and com.predidit.kazumi/storage.
         ARDisplayManager.shared.attach(with: engineBridge.applicationRegistrar.messenger())
+        // Offline video Anime4K upscaling tool (native UI opened from the settings page).
+        Anime4KOfflineManager.shared.attach(with: engineBridge.applicationRegistrar.messenger())
         // Pre-register the iOS 27 external-display scene accessory ~1 s after launch and keep it
         // enabled for the whole app lifetime: the system only presents the accessory scene if a
         // registration exists (and is enabled) before the wired display starts mirroring the
