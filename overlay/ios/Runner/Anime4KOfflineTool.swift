@@ -17,17 +17,25 @@ import UniformTypeIdentifiers
 
 // MARK: - Flutter bridge
 
-final class Anime4KOfflineManager {
+final class Anime4KOfflineManager: NSObject, FlutterStreamHandler {
 
     static let shared = Anime4KOfflineManager()
 
     private var channel: FlutterMethodChannel?
+    private var eventChannel: FlutterEventChannel?
+    private var eventSink: FlutterEventSink?
 
     func attach(with messenger: FlutterBinaryMessenger) {
         let channel = FlutterMethodChannel(
             name: "com.predidit.kazumi/anime4k_offline",
             binaryMessenger: messenger
         )
+        let events = FlutterEventChannel(
+            name: "com.predidit.kazumi/anime4k_offline_events",
+            binaryMessenger: messenger
+        )
+        events.setStreamHandler(self)
+        self.eventChannel = events
         channel.setMethodCallHandler { [weak self] call, result in
             switch call.method {
             case "open":
@@ -42,6 +50,29 @@ final class Anime4KOfflineManager {
             }
         }
         self.channel = channel
+    }
+
+    /// 通知 Dart 侧：某个下载目录里的原视频已被替换（需要同步 Hive 里的本地路径）。
+    func send(event: [String: Any]) {
+        guard let sink = eventSink else { return }
+        DispatchQueue.main.async {
+            sink(event)
+        }
+    }
+
+    // MARK: FlutterStreamHandler
+
+    func onListen(
+        withArguments arguments: Any?,
+        eventSink events: @escaping FlutterEventSink
+    ) -> FlutterError? {
+        eventSink = events
+        return nil
+    }
+
+    func onCancel(withArguments arguments: Any?) -> FlutterError? {
+        eventSink = nil
+        return nil
     }
 
     private func presentTool() {
@@ -215,6 +246,9 @@ final class Anime4KOfflineToolViewController: UIViewController {
 
     private var inputURL: URL?
     private var inputIsPlaylist = false
+    /// 从「Kazumi 已下载视频」里选择时，记录该集所在的目录，用于完成后自动替换。
+    private var inputSourceDirectory: URL?
+    private var replaceResultText: String = ""
     private var transcoder: Anime4KOfflineTranscoder?
     private var hlsLoader: ARLocalHLSResourceLoader?
     private var remuxSession: AVAssetExportSession?
@@ -229,6 +263,9 @@ final class Anime4KOfflineToolViewController: UIViewController {
     private let chooseFileButton = UIButton(type: .system)
     private let choosePhotoButton = UIButton(type: .system)
     private let chooseDownloadedButton = UIButton(type: .system)
+    private let replaceSwitch = UISwitch()
+    private let replaceRow = UIStackView()
+    private let replaceHintLabel = UILabel()
     private let presetControl = UISegmentedControl(items: ["效率档", "质量档", "仅线条修复"])
     private let resolutionControl = UISegmentedControl(items: ["1080p", "1440p", "4K", "原分辨率"])
     private let startButton = UIButton(type: .system)
@@ -316,6 +353,27 @@ final class Anime4KOfflineToolViewController: UIViewController {
         sourceRow.axis = .vertical
         sourceRow.spacing = 8
         contentStack.addArrangedSubview(sourceRow)
+
+        // 下载视频：完成后自动替换原视频（写入同目录的 video.mp4，原文件备份）
+        let replaceTitle = UILabel()
+        replaceTitle.text = "完成后自动替换原视频"
+        replaceTitle.font = .preferredFont(forTextStyle: .body)
+        replaceRow.axis = .horizontal
+        replaceRow.spacing = 12
+        replaceRow.alignment = .center
+        replaceRow.addArrangedSubview(replaceTitle)
+        replaceRow.addArrangedSubview(UIView())
+        replaceRow.addArrangedSubview(replaceSwitch)
+        replaceSwitch.isOn = true
+        replaceHintLabel.numberOfLines = 0
+        replaceHintLabel.font = .preferredFont(forTextStyle: .caption1)
+        replaceHintLabel.textColor = .secondaryLabel
+        replaceHintLabel.text = "把超分结果写回该集下载目录的 video.mp4（原文件备份为 video_backup.mp4），"
+            + "Kazumi 的下载列表会直接播放新视频，不需要手动导出。"
+        replaceRow.isHidden = true
+        replaceHintLabel.isHidden = true
+        contentStack.addArrangedSubview(replaceRow)
+        contentStack.addArrangedSubview(replaceHintLabel)
 
         // 设置
         contentStack.addArrangedSubview(sectionTitle("2. 超分设置"))
@@ -481,7 +539,11 @@ final class Anime4KOfflineToolViewController: UIViewController {
             return
         }
         let picker = OfflineVideoPickerController(candidates: candidates) { [weak self] candidate in
-            self?.setInput(url: candidate.url, isPlaylist: candidate.isPlaylist)
+            self?.setInput(
+                url: candidate.url,
+                isPlaylist: candidate.isPlaylist,
+                sourceDirectory: candidate.url.deletingLastPathComponent()
+            )
         }
         let navigation = UINavigationController(rootViewController: picker)
         present(navigation, animated: true)
@@ -504,9 +566,13 @@ final class Anime4KOfflineToolViewController: UIViewController {
         present(picker, animated: true)
     }
 
-    private func setInput(url: URL, isPlaylist: Bool) {
+    private func setInput(url: URL, isPlaylist: Bool, sourceDirectory: URL? = nil) {
         inputURL = url
         inputIsPlaylist = isPlaylist
+        inputSourceDirectory = sourceDirectory
+        replaceResultText = ""
+        replaceRow.isHidden = sourceDirectory == nil
+        replaceHintLabel.isHidden = sourceDirectory == nil
         outputURL = nil
         updateSourceUI()
         savePhotosButton.isHidden = true
@@ -591,10 +657,43 @@ final class Anime4KOfflineToolViewController: UIViewController {
             detailLabel.text = (detailLabel.text ?? "") + "\n（音轨合并失败：输出为无声视频）"
         }
         outputURL = result.outputURL
+        performReplaceIfNeeded(result: result)
         savePhotosButton.isHidden = false
         shareButton.isHidden = false
         savedLabel.text = " "
         updateSourceUI()
+    }
+
+    /// 把超分结果写回下载目录：video.mp4（原文件备份为 video_backup.mp4），并通知 Dart 更新 Hive。
+    private func performReplaceIfNeeded(result: TranscodeResult) {
+        guard replaceSwitch.isOn, let directory = inputSourceDirectory else { return }
+        let fileManager = FileManager.default
+        let target = directory.appendingPathComponent("video.mp4")
+        do {
+            if fileManager.fileExists(atPath: target.path) {
+                let backup = directory.appendingPathComponent("video_backup.mp4")
+                try? fileManager.removeItem(at: backup)
+                try fileManager.moveItem(at: target, to: backup)
+            }
+            do {
+                try fileManager.moveItem(at: result.outputURL, to: target)
+            } catch {
+                try fileManager.copyItem(at: result.outputURL, to: target)
+                try? fileManager.removeItem(at: result.outputURL)
+            }
+            outputURL = target
+            replaceResultText = "已替换原视频：\(target.path)\n（原文件备份为 video_backup.mp4）"
+            Anime4KOfflineManager.shared.send(event: [
+                "type": "replaced",
+                "directory": directory.path,
+                "videoPath": target.path,
+            ])
+        } catch {
+            replaceResultText = "替换原视频失败：" + error.localizedDescription
+        }
+        if !replaceResultText.isEmpty {
+            detailLabel.text = (detailLabel.text ?? "") + "\n" + replaceResultText
+        }
     }
 
     private func fail(_ error: Error) {
