@@ -1,0 +1,131 @@
+name: bitchat-ios
+
+# Builds an unsigned iOS IPA for bitchat (https://github.com/permissionlesstech/bitchat),
+# a native Swift/SwiftUI P2P messenger (Bluetooth mesh + Nostr).
+# Optional overlay ./overlay-bitchat is copied over the checkout when patch_translate=true.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'macOS runner image'
+        required: true
+        default: 'xcode-27'
+        type: choice
+        options:
+          - xcode-27
+          - macos-26
+          - macos-latest
+      label:
+        description: 'artifact label suffix'
+        required: false
+        default: 'bitchat'
+      ref:
+        description: 'bitchat git ref (branch/tag/commit)'
+        required: false
+        default: 'main'
+      patch_translate:
+        description: 'apply overlay-bitchat (auto-translate feature)'
+        required: false
+        default: 'false'
+      skip_build:
+        description: 'only resolve packages (fast smoke test, no IPA)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    name: "Build unsigned IPA (bitchat)"
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v4
+
+      - name: Clone bitchat
+        run: |
+          set -euo pipefail
+          git clone https://github.com/permissionlesstech/bitchat.git app
+          cd app
+          git checkout "${{ inputs.ref }}"
+          echo "commit=$(git rev-parse HEAD)"
+          git log --oneline -1
+
+      - name: Apply overlay (auto-translate)
+        if: ${{ inputs.patch_translate == 'true' }}
+        run: |
+          set -euo pipefail
+          test -d overlay-bitchat
+          cd overlay-bitchat
+          find . -type f -print0 | while IFS= read -r -d '' f; do
+            rel="${f#./}"
+            mkdir -p "../app/$(dirname "$rel")"
+            cp "$f" "../app/$rel"
+            echo "patched $rel"
+          done
+
+      - name: Show Xcode
+        run: |
+          xcode-select -p
+          xcodebuild -version
+
+      - name: Resolve Swift packages
+        working-directory: app
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project bitchat.xcodeproj -scheme "bitchat (iOS)" | tail -20
+
+      - name: Build iOS (no codesign)
+        if: ${{ inputs.skip_build != 'true' }}
+        working-directory: app
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project bitchat.xcodeproj \
+            -scheme "bitchat (iOS)" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build_dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build 2>&1 | tee /tmp/bitchat_build.log | tail -40
+          echo "---- build result ----"
+          grep -E "^(BUILD|error:|warning: .*deprecated)" /tmp/bitchat_build.log | tail -20 || true
+
+      - name: Package unsigned IPA
+        if: ${{ inputs.skip_build != 'true' }}
+        working-directory: app
+        env:
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -euo pipefail
+          ls -la build_dd/Build/Products/Release-iphoneos/ || true
+          APP=$(find build_dd/Build/Products/Release-iphoneos -maxdepth 1 -name "*.app" | head -1)
+          echo "app=$APP"
+          test -n "$APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          if [ -d "Payload/$(basename "$APP")/PlugIns" ]; then
+            find "Payload/$(basename "$APP")/PlugIns" -name "*.appex" -type d \
+              -exec codesign --force --sign - {} \; || true
+          fi
+          if [ -d "Payload/$(basename "$APP")/Frameworks" ]; then
+            find "Payload/$(basename "$APP")/Frameworks" -name "*.framework" -type d \
+              -exec codesign --force --sign - {} \; || true
+          fi
+          OUT="bitchat_ios_${LABEL}_no_sign.ipa"
+          zip -q -r "$OUT" Payload
+          ls -lh "$OUT"
+          unzip -l "$OUT" | head -15
+
+      - name: Upload IPA
+        if: ${{ inputs.skip_build != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios_outputs_${{ inputs.label }}
+          path: app/bitchat_ios_*_no_sign.ipa
+          if-no-files-found: error
