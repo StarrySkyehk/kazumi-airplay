@@ -249,7 +249,9 @@ final class AutoTranslateStore: ObservableObject {
     @available(iOS 18.0, macOS 15.0, *)
     func runPrepare(session: TranslationSession) async {
         var notes: [String] = []
-        notes.append("canRequest=\(session.canRequestDownloads)")
+        if #available(iOS 26.0, macOS 26.0, *) {
+            notes.append("canRequest=\(session.canRequestDownloads)")
+        }
         do {
             try await session.prepareTranslation()
             notes.append("download ok")
