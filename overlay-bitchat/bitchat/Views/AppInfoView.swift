@@ -10,7 +10,6 @@ struct AppInfoView: View {
     @AppStorage(AppTheme.storageKey) private var appThemeRawValue = AppTheme.matrix.rawValue
     @EnvironmentObject private var locationChannelsModel: LocationChannelsModel
     @ObservedObject private var bridgeService = BridgeService.shared
-    @ObservedObject private var autoTranslate = AutoTranslateStore.shared
 
     /// Supplies the mesh topology map data. Nil (previews, missing wiring)
     /// hides the topology row entirely.
@@ -406,43 +405,8 @@ struct AppInfoView: View {
 
             // Auto-translate — on-device translation of incoming messages,
             // shown under the original text. Nothing leaves the device.
-            VStack(alignment: .leading, spacing: 12) {
-                SectionHeader(verbatim: "AUTO-TRANSLATE")
-
-                settingsCard {
-                    settingToggle(
-                        title: Text(verbatim: "translate incoming messages"),
-                        subtitle: Text(verbatim: "messages written in another language are translated on this device and shown under the original. nothing is sent to a server. the first message in a new language may ask you to download that language pack once."),
-                        isOn: $autoTranslate.enabled
-                    )
-
-                    Menu {
-                        ForEach(AutoTranslateTarget.allCases) { target in
-                            Button {
-                                autoTranslate.target = target
-                            } label: {
-                                menuItemLabel(target.displayName, isSelected: autoTranslate.target == target)
-                            }
-                        }
-                    } label: {
-                        HStack {
-                            Text(verbatim: "target language")
-                                .bitchatFont(size: 12, weight: .semibold)
-                                .foregroundColor(textColor)
-                            Spacer()
-                            Text(verbatim: autoTranslate.target.displayName)
-                                .bitchatFont(size: 12)
-                                .foregroundColor(palette.accent)
-                            Image(systemName: "chevron.up.chevron.down")
-                                .font(.system(size: 10))
-                                .foregroundColor(secondaryTextColor)
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!autoTranslate.enabled)
-                    .opacity(autoTranslate.enabled ? 1 : 0.5)
-                }
+            if #available(iOS 18.0, macOS 15.0, *) {
+                AutoTranslateSettingsSection()
             }
 
             // Voice — same card + IRC pill as every other toggle setting.
