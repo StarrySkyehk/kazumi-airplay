@@ -32,6 +32,10 @@ on:
         description: 'only run pub get + pod install (fast smoke test, no IPA)'
         required: false
         default: 'false'
+      patch_uiscene:
+        description: 'apply overlay-goguma (UIScene migration, required for iOS 27)'
+        required: false
+        default: 'false'
 
 permissions:
   contents: read
@@ -42,6 +46,9 @@ jobs:
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 120
     steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v4
+
       - name: Clone goguma (Codeberg)
         run: |
           set -euo pipefail
@@ -50,6 +57,22 @@ jobs:
           git checkout "${{ inputs.ref }}"
           echo "commit=$(git rev-parse HEAD)"
           git log --oneline -1
+
+      - name: Apply UIScene migration overlay (iOS 27 requirement)
+        if: ${{ inputs.patch_uiscene == 'true' }}
+        run: |
+          set -euo pipefail
+          test -d overlay-goguma
+          cd overlay-goguma
+          find . -type f -print0 | while IFS= read -r -d '' f; do
+            rel="${f#./}"
+            mkdir -p "../app/$(dirname "$rel")"
+            cp "$f" "../app/$rel"
+            echo "patched $rel"
+          done
+          cd ..
+          grep -q UIApplicationSceneManifest app/ios/Runner/Info.plist && echo "scene manifest present"
+          grep -q FlutterImplicitEngineDelegate app/ios/Runner/AppDelegate.swift && echo "implicit engine delegate present"
 
       - name: Show Xcode
         run: |
