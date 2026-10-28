@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 import 'package:kazumi/bean/dialog/dialog_helper.dart';
 import 'package:kazumi/services/logging/logger.dart';
 import 'package:kazumi/services/player/ar_display_service.dart';
+import 'package:kazumi/services/storage/settings_keys.dart';
+import 'package:kazumi/services/storage/storage.dart';
 import 'package:kazumi/utils/format.dart';
 
 /// AR 眼镜投屏期间显示在手机上的全屏遥控页（手机不渲染视频）。
@@ -69,6 +71,17 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
   double? _heldSpeed;
   bool _holdingFast = false;
 
+  /// 「跳过片头」秒数（复用播放设置里的「顶部按钮快进时长」，可在本页长按调整）。
+  int _skipSeconds = 80;
+
+  /// 左右滑动调整进度：拖动中的预览位置（null 表示没有在拖）。
+  double? _swipePreviewMs;
+  double _swipeDeltaPx = 0;
+  double _swipeStartMs = 0;
+
+  /// 每滑过 1 像素对应的秒数。
+  static const double _secondsPerPixel = 0.4;
+
   static const List<double> _speedOptions = <double>[
     0.5,
     0.75,
@@ -86,6 +99,7 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
     _danmakuEnabled = widget.danmakuEnabled;
     _positionMs = math.max(0, widget.initialPositionMs);
     _durationMs = math.max(0, widget.durationMs);
+    _skipSeconds = GStorage.getSetting<int>(SettingsKeys.buttonSkipTime);
     _eventSubscription = ARDisplayService.events.listen(_handleEvent);
     unawaited(_refreshDisplayState());
   }
@@ -161,7 +175,7 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
           if (durationMs > 0) {
             _durationMs = durationMs;
           }
-          if (_dragPositionMs == null) {
+          if (_dragPositionMs == null && _swipePreviewMs == null) {
             _positionMs = positionMs;
           }
           // 原生恢复可播放时会把 error 清空，这里同步跟随。
@@ -247,6 +261,99 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
     await _setSpeed(restore, showToast: false);
   }
 
+  /// 跳过片头：从当前位置快进 [_skipSeconds] 秒。
+  Future<void> _skipForward() async {
+    if (!_canControl || _durationMs <= 0) {
+      return;
+    }
+    final int target = (_positionMs + _skipSeconds * 1000)
+        .clamp(0, _durationMs)
+        .toInt();
+    setState(() {
+      _positionMs = target;
+      _ended = false;
+    });
+    await _seek(target);
+  }
+
+  /// 长按「跳过」按钮：调整跳过秒数（写回播放设置，和手机端的快进按钮共用）。
+  Future<void> _editSkipSeconds() async {
+    final TextEditingController controller =
+        TextEditingController(text: _skipSeconds.toString());
+    final int? result = await showDialog<int>(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: const Text('跳过时长'),
+          content: TextField(
+            controller: controller,
+            autofocus: true,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: '秒数（1-600）',
+              helperText: '与手机端播放器的「顶部按钮快进时长」共用',
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('取消'),
+            ),
+            TextButton(
+              onPressed: () {
+                final int? parsed = int.tryParse(controller.text.trim());
+                Navigator.of(context).pop(parsed);
+              },
+              child: const Text('确定'),
+            ),
+          ],
+        );
+      },
+    );
+    controller.dispose();
+    if (!mounted || result == null) {
+      return;
+    }
+    final int seconds = result.clamp(1, 600);
+    setState(() => _skipSeconds = seconds);
+    await GStorage.putSetting<int>(SettingsKeys.buttonSkipTime, seconds);
+  }
+
+  void _swipeStart(DragStartDetails details) {
+    if (!_canControl || _durationMs <= 0) {
+      return;
+    }
+    _swipeStartMs = (_dragPositionMs ?? _positionMs.toDouble());
+    _swipeDeltaPx = 0;
+    setState(() => _swipePreviewMs = _swipeStartMs);
+  }
+
+  void _swipeUpdate(DragUpdateDetails details) {
+    if (_swipePreviewMs == null) {
+      return;
+    }
+    _swipeDeltaPx += details.delta.dx;
+    final double targetMs = (_swipeStartMs +
+            _swipeDeltaPx * _secondsPerPixel * 1000)
+        .clamp(0.0, _durationMs.toDouble())
+        .toDouble();
+    setState(() => _swipePreviewMs = targetMs);
+  }
+
+  Future<void> _swipeEnd([DragEndDetails? details]) async {
+    final double? target = _swipePreviewMs;
+    if (target == null) {
+      return;
+    }
+    setState(() {
+      _swipePreviewMs = null;
+      _swipeDeltaPx = 0;
+      _positionMs = target.round();
+      _ended = false;
+    });
+    await _seek(target.round());
+  }
+
   Future<void> _setDanmakuEnabled(bool enabled) async {
     if (!_canControl) {
       return;
@@ -320,6 +427,17 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
                               : null,
                           onLongPressCancel: _canControl
                               ? () => unawaited(_endHoldFast())
+                              : null,
+                          onHorizontalDragStart:
+                              _canControl ? _swipeStart : null,
+                          onHorizontalDragUpdate:
+                              _canControl ? _swipeUpdate : null,
+                          onHorizontalDragEnd: _canControl
+                              ? (DragEndDetails details) =>
+                                  unawaited(_swipeEnd(details))
+                              : null,
+                          onHorizontalDragCancel: _canControl
+                              ? () => unawaited(_swipeEnd())
                               : null,
                           child: _buildStatus(context),
                         ),
@@ -396,6 +514,18 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
                 : '超分未生效，已回退普通投屏',
             textAlign: TextAlign.center,
             style: textTheme.bodySmall?.copyWith(color: Colors.white38),
+          ),
+        ],
+        if (_swipePreviewMs != null) ...[
+          const SizedBox(height: 12),
+          Text(
+            _swipeLabel(_swipePreviewMs!),
+            textAlign: TextAlign.center,
+            style: textTheme.titleMedium?.copyWith(
+              color: Colors.lightBlueAccent,
+              fontWeight: FontWeight.w600,
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
           ),
         ],
         if (_holdingFast) ...[
@@ -529,11 +659,20 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
         ),
         const SizedBox(height: 6),
         const Text(
-          '长按上方状态区域：临时 2× 快进，松手恢复原倍速',
+          '上方状态区域：左右滑动调整进度；长按临时 2× 快进（松手恢复）\n'
+          '长按「跳过」按钮可以改跳过秒数',
           style: TextStyle(color: Colors.white38, fontSize: 12),
         ),
       ],
     );
+  }
+
+  String _swipeLabel(double targetMs) {
+    final int deltaSeconds =
+        ((targetMs - _swipeStartMs) / 1000).round();
+    final String sign = deltaSeconds >= 0 ? '+' : '';
+    return '进度 ${durationToString(Duration(milliseconds: targetMs.round()))}'
+        '（$sign${deltaSeconds}s）';
   }
 
   String _chipLabel(double value) {
@@ -547,10 +686,11 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
     final bool canControl = _canControl;
     final double maxPosition = _durationMs > 0 ? _durationMs.toDouble() : 1.0;
     final double sliderValue =
-        (_dragPositionMs ?? _positionMs.toDouble())
+        (_dragPositionMs ?? _swipePreviewMs ?? _positionMs.toDouble())
             .clamp(0.0, maxPosition)
             .toDouble();
-    final int labelPositionMs = _dragPositionMs?.round() ?? _positionMs;
+    final int labelPositionMs =
+        (_dragPositionMs ?? _swipePreviewMs)?.round() ?? _positionMs;
     final String playTooltip = _playing
         ? '暂停'
         : _ended
@@ -591,19 +731,41 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
               : null,
         ),
         const SizedBox(height: 8),
-        Center(
-          child: IconButton(
-            iconSize: 56,
-            color: Colors.white,
-            disabledColor: Colors.white24,
-            tooltip: playTooltip,
-            onPressed: canControl ? () => unawaited(_togglePlay()) : null,
-            icon: Icon(
-              _playing
-                  ? Icons.pause_circle_filled_rounded
-                  : Icons.play_circle_filled_rounded,
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            GestureDetector(
+              onLongPress:
+                  canControl ? () => unawaited(_editSkipSeconds()) : null,
+              child: OutlinedButton.icon(
+                onPressed:
+                    canControl ? () => unawaited(_skipForward()) : null,
+                icon: const Icon(Icons.skip_next_rounded, size: 20),
+                label: Text('跳过 $_skipSeconds 秒'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.lightBlueAccent,
+                  side: const BorderSide(color: Colors.white24),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 14,
+                    vertical: 10,
+                  ),
+                ),
+              ),
             ),
-          ),
+            const SizedBox(width: 28),
+            IconButton(
+              iconSize: 56,
+              color: Colors.white,
+              disabledColor: Colors.white24,
+              tooltip: playTooltip,
+              onPressed: canControl ? () => unawaited(_togglePlay()) : null,
+              icon: Icon(
+                _playing
+                    ? Icons.pause_circle_filled_rounded
+                    : Icons.play_circle_filled_rounded,
+              ),
+            ),
+          ],
         ),
         const SizedBox(height: 8),
         _buildSpeedControl(canControl),
