@@ -83,7 +83,7 @@ jobs:
         if: ${{ inputs.skip_build != 'true' }}
         working-directory: app
         run: |
-          set -euo pipefail
+          set +e
           xcodebuild \
             -project bitchat.xcodeproj \
             -scheme "bitchat (iOS)" \
@@ -92,9 +92,22 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath build_dd \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            build 2>&1 | tee /tmp/bitchat_build.log | tail -40
-          echo "---- build result ----"
-          grep -E "^(BUILD|error:|warning: .*deprecated)" /tmp/bitchat_build.log | tail -20 || true
+            build > /tmp/bitchat_build.log 2>&1
+          STATUS=$?
+          echo "xcodebuild exit: $STATUS"
+          echo "---- errors ----"
+          grep -nE "(error:|fatal error:)" /tmp/bitchat_build.log | grep -v "0 error" | head -40 || true
+          echo "---- tail ----"
+          tail -25 /tmp/bitchat_build.log
+          exit $STATUS
+
+      - name: Upload build log
+        if: always() && inputs.skip_build != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildlog_${{ inputs.label }}
+          path: /tmp/bitchat_build.log
+          if-no-files-found: warn
 
       - name: Package unsigned IPA
         if: ${{ inputs.skip_build != 'true' }}

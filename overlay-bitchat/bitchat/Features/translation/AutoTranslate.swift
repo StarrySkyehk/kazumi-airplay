@@ -253,7 +253,7 @@ final class AutoTranslateStore: ObservableObject {
         do {
             try await session.prepareTranslation()
             notes.append("download ok")
-            let sample = Self.sampleText(for: self.lastPrepareCode)
+            let sample = Self.sampleTextForLanguage(self.lastPrepareCode)
             do {
                 let response = try await session.translate(sample)
                 notes.append("测试「\(sample)」→ \(String(response.targetText.prefix(24)))")
@@ -430,7 +430,7 @@ final class AutoTranslateStore: ObservableObject {
 
     static let sampleText = "Good morning, how are you?"
 
-    static func sampleText(for code: String) -> String {
+    static func sampleTextForLanguage(_ code: String) -> String {
         let table: [String: String] = [
             "fr": "Bonjour, comment allez-vous ?",
             "en": "Good morning, how are you?",
