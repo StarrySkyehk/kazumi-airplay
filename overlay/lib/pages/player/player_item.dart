@@ -1194,10 +1194,14 @@ class _PlayerItemState extends State<PlayerItem>
 
   List<ARDisplayDanmakuItem> _buildArDisplayDanmaku() {
     final List<DanmakuEntry> entries = playerController.danmaku.allDanmakus();
+    // 弹幕时间校准：手机端的映射是「播放位置 - 偏移 = 弹幕源时间」，
+    // 所以眼镜端的显示时间 = 弹幕源时间 + 偏移，和手机端保持一致。
+    final double offsetMs =
+        playerController.danmaku.timelineOffsetSeconds * 1000.0;
     return <ARDisplayDanmakuItem>[
       for (final DanmakuEntry entry in entries)
         ARDisplayDanmakuItem(
-          timeMs: entry.time * 1000.0,
+          timeMs: entry.time * 1000.0 + offsetMs,
           message: entry.message,
           color: _arDisplayColorValue(entry.color),
           type: _arDisplayDanmakuType(entry),
