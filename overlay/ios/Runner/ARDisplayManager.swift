@@ -812,7 +812,6 @@ final class ARDisplayManager: NSObject {
         self.externalWindowScene = windowScene
         self.displayViewController = sceneDelegate.playerViewController
         isDisplayConnected = true
-        wasPlayingBeforeDisconnect = false
         isKickInProgress = false
         startKickWorkItem?.cancel()
         startKickWorkItem = nil
@@ -830,10 +829,16 @@ final class ARDisplayManager: NSObject {
             self.assertExternalWindowVisible()
             self.sendStateEvent()
         }
-        // A player may already exist (a `start` waiting for this scene, or a reconnect while
-        // playing); otherwise the glasses show the idle page.
-        attachPlayerToExternalDisplay()
-        if player == nil, let viewController = displayViewController {
+        // 三种情况：
+        // 1) 有一个等待外接屏的 `start`：回到投屏起点；
+        // 2) 断联后重插（系统新建了 scene）：沿用当前播放位置，不要回到起点；
+        // 3) 没有播放器：显示空闲页。
+        if startPendingResult != nil {
+            attachPlayerToExternalDisplay()
+            wasPlayingBeforeDisconnect = false
+        } else if player != nil {
+            reattachExistingPlayerAfterReconnect()
+        } else if let viewController = displayViewController {
             viewController.showIdleState(true)
         }
         resolvePendingStartIfPossible()
@@ -913,18 +918,25 @@ final class ARDisplayManager: NSObject {
         DispatchQueue.main.async { [weak self] in
             self?.assertExternalWindowVisible()
         }
-        attachPlayerToExternalDisplay(applyStartPosition: false)
-        if player == nil {
+        if player != nil {
+            reattachExistingPlayerAfterReconnect()
+        } else {
             displayViewController?.showIdleState(true)
-        } else if wasPlayingBeforeDisconnect {
+        }
+        resolvePendingStartIfPossible()
+        sendStateEvent()
+    }
+
+    /// 眼镜重插：沿用当前播放位置重新挂载播放器，并按断联前状态恢复播放/暂停。
+    private func reattachExistingPlayerAfterReconnect() {
+        attachPlayerToExternalDisplay(applyStartPosition: false)
+        if wasPlayingBeforeDisconnect {
             startPlayback()
         } else {
-            // 断联前是暂停状态：重插后保持暂停，不要自动起播。
             player?.pause()
             displayViewController?.setDanmakuPaused(true)
         }
         wasPlayingBeforeDisconnect = false
-        resolvePendingStartIfPossible()
         sendStateEvent()
     }
 

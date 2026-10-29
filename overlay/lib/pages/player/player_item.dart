@@ -1504,9 +1504,10 @@ class _PlayerItemState extends State<PlayerItem>
 
   Future<void> _releaseMobilePlaybackForHandoff() async {
     try {
-      final bool released = await playerController
-          .releasePlaybackForExternalDisplay()
-          .timeout(const Duration(seconds: 12), onTimeout: () => false);
+      // 不能用 Future.timeout 包住：超时不会取消内层释放，晚到的 playback.stop()
+      // 会把恢复后的播放器销毁并重新置 loading=true（表现为永远「播放器加载中」）。
+      final bool released =
+          await playerController.releasePlaybackForExternalDisplay();
       KazumiLogger().i('AR: mobile playback released=$released');
     } catch (error, stackTrace) {
       KazumiLogger().w(
@@ -1523,10 +1524,13 @@ class _PlayerItemState extends State<PlayerItem>
     if (release == null) {
       return;
     }
+    // 必须等释放彻底结束：释放链里的 playback.stop() 会把 loading 置回 true 并销毁播放器，
+    // 如果它在恢复播放之后才完成，页面就会永远停在「播放器加载中」。
     try {
-      await release.timeout(const Duration(seconds: 6));
+      await release.timeout(const Duration(seconds: 45));
+      KazumiLogger().i('AR: background playback release finished');
     } on TimeoutException {
-      KazumiLogger().w('AR: waiting for playback release timed out');
+      KazumiLogger().w('AR: waiting for playback release timed out (45s)');
     }
   }
 
@@ -1554,6 +1558,7 @@ class _PlayerItemState extends State<PlayerItem>
       KazumiLogger().e(
         'PlayerItem: failed to resume playback after AR display',
       );
+      playerController.playback.loading = false;
       return;
     }
     if (!mounted) {
@@ -1563,6 +1568,17 @@ class _PlayerItemState extends State<PlayerItem>
     unawaited(_bindAudioService());
     _restartPlayerTimer();
     showVideoController();
+    // 保险：如果还有晚到的释放把 loading 置回 true，5 秒后清一次，避免停在加载页。
+    Future.delayed(const Duration(seconds: 5), () {
+      if (!mounted || _arDisplayInProgress) {
+        return;
+      }
+      if (playerController.playback.loading &&
+          playerController.playback.mediaPlayer != null) {
+        KazumiLogger().w('AR: loading watchdog cleared playback.loading');
+        playerController.playback.loading = false;
+      }
+    });
   }
 
   void _emitDanmakusForCurrentPosition() {
