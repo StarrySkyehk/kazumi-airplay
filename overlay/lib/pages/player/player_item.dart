@@ -25,6 +25,7 @@ import 'package:canvas_danmaku/canvas_danmaku.dart';
 import 'package:kazumi/bean/dialog/dialog_helper.dart';
 import 'package:kazumi/pages/player/video_details_sheet.dart';
 import 'package:screen_brightness_platform_interface/screen_brightness_platform_interface.dart';
+import 'package:kazumi/modules/history/history_module.dart';
 import 'package:kazumi/pages/history/history_controller.dart';
 import 'package:kazumi/services/storage/storage.dart';
 import 'package:kazumi/modules/danmaku/danmaku_module.dart';
@@ -105,6 +106,8 @@ class _PlayerItemState extends State<PlayerItem>
   static const double _arDanmakuFontScaleMin = 0.4;
   static const double _arDanmakuFontScaleMax = 3.0;
   bool _arDisplayInProgress = false;
+  StreamSubscription<ARDisplayEvent>? _arHistorySubscription;
+  int _arLastHistorySecond = -1;
   bool _arConnectingDialogVisible = false;
   bool _arConnectingCancelled = false;
   bool _arCancelResumeStarted = false;
@@ -1141,6 +1144,54 @@ class _PlayerItemState extends State<PlayerItem>
   }
 
   /// 把已加载弹幕转换成原生通道载荷：`{t 毫秒, m, c 0xRRGGBB, y}`。
+  /// 投屏期间按原生状态事件的进度持续写观看历史：投屏时手机端计时器是停的，
+  /// 否则退出投屏后重新打开视频会丢失这一段进度。
+  void _startArHistoryRecording({required int durationMs}) {
+    final PlaybackHistoryIdentity? identity =
+        videoPageController.currentHistoryIdentity;
+    if (identity == null || !identity.canRecord) {
+      return;
+    }
+    _arLastHistorySecond = -1;
+    _arHistorySubscription?.cancel();
+    _arHistorySubscription = ARDisplayService.events.listen((event) {
+      if (event is! ARDisplayStateEvent || event.positionMs <= 0) {
+        return;
+      }
+      final int second = event.positionMs ~/ 1000;
+      if (second == _arLastHistorySecond) {
+        return;
+      }
+      _arLastHistorySecond = second;
+      final int duration =
+          event.durationMs > 0 ? event.durationMs : durationMs;
+      unawaited(historyController.updateHistory(
+        identity,
+        Duration(milliseconds: event.positionMs),
+        duration: Duration(milliseconds: duration),
+      ));
+    });
+  }
+
+  void _stopArHistoryRecording() {
+    _arHistorySubscription?.cancel();
+    _arHistorySubscription = null;
+    _arLastHistorySecond = -1;
+  }
+
+  void _recordArHistory({required int positionMs, required int durationMs}) {
+    final PlaybackHistoryIdentity? identity =
+        videoPageController.currentHistoryIdentity;
+    if (identity == null || !identity.canRecord || positionMs <= 0) {
+      return;
+    }
+    unawaited(historyController.updateHistory(
+      identity,
+      Duration(milliseconds: positionMs),
+      duration: Duration(milliseconds: durationMs),
+    ));
+  }
+
   List<ARDisplayDanmakuItem> _buildArDisplayDanmaku() {
     final List<DanmakuEntry> entries = playerController.danmaku.allDanmakus();
     return <ARDisplayDanmakuItem>[
@@ -1373,6 +1424,7 @@ class _PlayerItemState extends State<PlayerItem>
         return;
       }
       KazumiLogger().i('AR: remote page opening');
+      _startArHistoryRecording(durationMs: durationMs);
       final int? endPositionMs = await Navigator.of(context).push<int>(
         MaterialPageRoute<int>(
           fullscreenDialog: true,
@@ -1387,6 +1439,11 @@ class _PlayerItemState extends State<PlayerItem>
         ),
       );
       KazumiLogger().i('AR: remote page closed, endPosition=$endPositionMs');
+      _stopArHistoryRecording();
+      _recordArHistory(
+        positionMs: endPositionMs ?? startPositionMs,
+        durationMs: durationMs,
+      );
       if (!mounted) {
         return;
       }
@@ -1410,6 +1467,7 @@ class _PlayerItemState extends State<PlayerItem>
       }
     } finally {
       _hideArConnectingDialog();
+      _stopArHistoryRecording();
       _arDisplayInProgress = false;
       _arCancelResumeStarted = false;
       KazumiLogger().i('AR: handoff flow finished');

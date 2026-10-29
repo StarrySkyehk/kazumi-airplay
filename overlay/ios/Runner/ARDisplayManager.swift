@@ -144,6 +144,8 @@ final class ARDisplayManager: NSObject {
     private weak var externalWindowScene: UIWindowScene?
     private var displayViewController: ARDisplayPlayerViewController?
     private var isDisplayConnected = false
+    /// 断联前手机端是否正在播放：重插眼镜后用于自动恢复。
+    private var wasPlayingBeforeDisconnect = false
     private var screenWidth = 0
     private var screenHeight = 0
     /// Fallback path for iOS builds where the scene accessory never connects but the wired
@@ -769,7 +771,7 @@ final class ARDisplayManager: NSObject {
         displayViewController?.seekDanmaku(toMilliseconds: clamped)
     }
 
-    private func attachPlayerToExternalDisplay() {
+    private func attachPlayerToExternalDisplay(applyStartPosition: Bool = true) {
         guard let viewController = displayViewController, let player = player else { return }
         // Re-assert the window at start time too: the scene can be connected while the system
         // is still mirroring the phone (the `windowVisible` diagnostic covers this case).
@@ -781,7 +783,11 @@ final class ARDisplayManager: NSObject {
             config: danmakuConfig
         )
         viewController.showIdleState(false)
-        applySeek(toMilliseconds: pendingStartPositionMilliseconds)
+        if applyStartPosition {
+            // 只有真正 start 时才回到投屏起点；重插眼镜必须沿用当前播放位置。
+            applySeek(toMilliseconds: pendingStartPositionMilliseconds)
+            pendingStartPositionMilliseconds = 0
+        }
         startPlayback()
         sendStateEvent()
     }
@@ -806,6 +812,7 @@ final class ARDisplayManager: NSObject {
         self.externalWindowScene = windowScene
         self.displayViewController = sceneDelegate.playerViewController
         isDisplayConnected = true
+        wasPlayingBeforeDisconnect = false
         isKickInProgress = false
         startKickWorkItem?.cancel()
         startKickWorkItem = nil
@@ -834,6 +841,13 @@ final class ARDisplayManager: NSObject {
 
     func handleExternalSceneDisconnected() {
         let wasConnected = isDisplayConnected
+        // 眼镜拔掉时保留 AVPlayer 会话并暂停：用户大概率会重新插回，
+        // 重插后由 handleExternalSceneReactivated 重新挂载并继续播放。
+        if let player = player {
+            wasPlayingBeforeDisconnect = player.rate != 0
+            player.pause()
+        }
+        displayViewController?.setDanmakuPaused(true)
         displayViewController = nil
         sceneDelegate = nil
         externalWindowScene = nil
@@ -851,16 +865,15 @@ final class ARDisplayManager: NSObject {
         startKickWorkItem = nil
         accessoryKickWorkItem?.cancel()
         accessoryKickWorkItem = nil
-        // The scene (and its window) is gone: a pending `start` can never succeed and the
-        // player cannot be shown anywhere, so both are torn down exactly once here.
+        // 播放会话保留（暂停中）：重插眼镜后 handleExternalSceneReactivated 会重新挂载。
         if startPendingResult != nil {
             flushPendingStart(failureMessage: "外接屏已断开，请确认眼镜已用 USB‑C 连接")
         }
-        if player != nil {
-            teardownPlayback()
-        }
         if wasConnected {
             sendEvent(["type": "disconnected"])
+        }
+        if player != nil {
+            sendStateEvent()
         }
     }
 
@@ -876,6 +889,43 @@ final class ARDisplayManager: NSObject {
             displayViewController?.showIdleState(true)
         }
         arLog("external scene became active: windowVisible=\(isExternalWindowVisible())")
+    }
+
+    /// 重插眼镜：系统可能复用同一个 UIScene（只触发 didBecomeActive，不再 willConnect），
+    /// 这里把管理器的状态重新挂上，避免必须「结束投屏再投屏」才能认到眼镜。
+    func handleExternalSceneReactivatedIfNeeded(
+        windowScene: UIWindowScene,
+        sceneDelegate: ARDisplaySceneDelegate
+    ) {
+        guard !isDisplayConnected else { return }
+        arLog("external scene reactivated (glasses re-plugged)")
+        self.sceneDelegate = sceneDelegate
+        self.externalWindowScene = windowScene
+        self.displayViewController = sceneDelegate.playerViewController
+        isDisplayConnected = true
+        updateScreenMetrics(from: windowScene)
+        sendEvent([
+            "type": "connected",
+            "width": screenWidth,
+            "height": screenHeight,
+            "windowVisible": isExternalWindowVisible(),
+        ])
+        DispatchQueue.main.async { [weak self] in
+            self?.assertExternalWindowVisible()
+        }
+        attachPlayerToExternalDisplay(applyStartPosition: false)
+        if player == nil {
+            displayViewController?.showIdleState(true)
+        } else if wasPlayingBeforeDisconnect {
+            startPlayback()
+        } else {
+            // 断联前是暂停状态：重插后保持暂停，不要自动起播。
+            player?.pause()
+            displayViewController?.setDanmakuPaused(true)
+        }
+        wasPlayingBeforeDisconnect = false
+        resolvePendingStartIfPossible()
+        sendStateEvent()
     }
 
     /// Whether our external-display window is actually on screen (not just created).
@@ -1031,6 +1081,7 @@ final class ARDisplayManager: NSObject {
         lastKnownError = nil
         playbackSpeed = 1.0
         pendingStartPositionMilliseconds = 0
+        wasPlayingBeforeDisconnect = false
         danmakuItems = []
 
         // Keep the external window and the accessory registration alive: the glasses switch to

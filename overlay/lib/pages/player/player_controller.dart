@@ -242,6 +242,9 @@ class PlayerController implements Disposable {
       return false;
     }
     if (player == null || !_ownsInitialization(initialization, player)) {
+      if (initialization.isActive) {
+        playback.loading = false;
+      }
       return false;
     }
 
@@ -511,8 +514,62 @@ class PlayerController implements Disposable {
     required int positionMs,
     required bool resumePlaying,
   }) async {
+    bool resumed = false;
+    try {
+      resumed = await _resumePlaybackAfterExternalDisplayImpl(
+        positionMs: positionMs,
+        resumePlaying: resumePlaying,
+      );
+    } catch (error, stackTrace) {
+      KazumiLogger().e(
+        'PlayerController: resume after AR threw',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      resumed = false;
+    }
+    if (resumed) {
+      return true;
+    }
+    // 兜底：把可能残留的播放资源彻底停掉后重试一次，避免停在「播放器加载中」。
+    KazumiLogger().w('PlayerController: AR resume failed, retrying once');
+    try {
+      await stop().timeout(const Duration(seconds: 8));
+    } catch (error, stackTrace) {
+      KazumiLogger().w(
+        'PlayerController: stop before AR resume retry failed',
+        error: error,
+        stackTrace: stackTrace,
+      );
+    }
+    try {
+      resumed = await _resumePlaybackAfterExternalDisplayImpl(
+        positionMs: positionMs,
+        resumePlaying: resumePlaying,
+      );
+    } catch (error, stackTrace) {
+      KazumiLogger().e(
+        'PlayerController: AR resume retry threw',
+        error: error,
+        stackTrace: stackTrace,
+      );
+      resumed = false;
+    }
+    if (!resumed) {
+      // 无论如何都要退出 loading，页面才能显示错误/继续操作。
+      playback.loading = false;
+      _showArResumeFailureToast();
+    }
+    return resumed;
+  }
+
+  Future<bool> _resumePlaybackAfterExternalDisplayImpl({
+    required int positionMs,
+    required bool resumePlaying,
+  }) async {
     final PlaybackInitParams? params = _lastPlaybackInitParams;
     if (params == null) {
+      playback.loading = false;
       _showArResumeFailureToast();
       return false;
     }

@@ -59,12 +59,38 @@ final class ARDisplaySceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     func sceneDidBecomeActive(_ scene: UIScene) {
         guard let windowScene = scene as? UIWindowScene else { return }
+        // 眼镜重插时系统可能复用同一个 scene（只回调 didBecomeActive）：窗口在断联时
+        // 已被 teardown，这里重建窗口并把会话挂回管理器，避免必须「结束投屏再投屏」。
+        if window == nil || playerViewController == nil {
+            rebuildWindow(windowScene: windowScene)
+        }
         // Re-assert the external window on activation: when the scene connects while the phone
         // display is still being mirrored, the window must be visible to take over the screen.
         ARDisplayManager.shared.handleExternalSceneBecameActive(windowScene: windowScene)
+        ARDisplayManager.shared.handleExternalSceneReactivatedIfNeeded(
+            windowScene: windowScene,
+            sceneDelegate: self
+        )
+    }
+
+    func sceneWillEnterForeground(_ scene: UIScene) {
+        guard let windowScene = scene as? UIWindowScene else { return }
+        if window == nil || playerViewController == nil {
+            rebuildWindow(windowScene: windowScene)
+        }
     }
 
     // MARK: - Window
+
+    /// 断联会关闭窗口；重插（复用同一 scene）时重建窗口并让它接管外接屏。
+    private func rebuildWindow(windowScene: UIWindowScene) {
+        let newWindow = UIWindow(windowScene: windowScene)
+        let viewController = ARDisplayPlayerViewController()
+        newWindow.rootViewController = viewController
+        window = newWindow
+        playerViewController = viewController
+        newWindow.makeKeyAndVisible()
+    }
 
     /// Closes the external window (only used when the scene is genuinely going away, never on
     /// `stop`: the window is permanent so the next projection does not fall back to mirroring).

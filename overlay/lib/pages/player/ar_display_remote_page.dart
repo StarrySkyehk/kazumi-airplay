@@ -439,6 +439,9 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
                           onHorizontalDragCancel: _canControl
                               ? () => unawaited(_swipeEnd())
                               : null,
+                          onDoubleTap: _canControl
+                              ? () => unawaited(_togglePlay())
+                              : null,
                           child: _buildStatus(context),
                         ),
                       ),
@@ -467,6 +470,23 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
               child: Text(
                 'AR 眼镜播放',
                 style: textTheme.titleMedium?.copyWith(color: Colors.white70),
+              ),
+            ),
+            GestureDetector(
+              onLongPress:
+                  _canControl ? () => unawaited(_editSkipSeconds()) : null,
+              child: OutlinedButton.icon(
+                onPressed: _canControl ? () => unawaited(_skipForward()) : null,
+                icon: const Icon(Icons.skip_next_rounded, size: 18),
+                label: Text('跳过 $_skipSeconds 秒'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.lightBlueAccent,
+                  side: const BorderSide(color: Colors.white24),
+                  visualDensity: VisualDensity.compact,
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                  textStyle: const TextStyle(fontSize: 12),
+                ),
               ),
             ),
           ],
@@ -659,8 +679,8 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
         ),
         const SizedBox(height: 6),
         const Text(
-          '上方状态区域：左右滑动调整进度；长按临时 2× 快进（松手恢复）\n'
-          '长按「跳过」按钮可以改跳过秒数',
+          '状态区域：双击暂停/播放，左右滑动调整进度，长按临时 2× 快进（松手恢复）\n'
+          '右上角「跳过」按钮的快进秒数可以长按修改',
           style: TextStyle(color: Colors.white38, fontSize: 12),
         ),
       ],
@@ -691,11 +711,6 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
             .toDouble();
     final int labelPositionMs =
         (_dragPositionMs ?? _swipePreviewMs)?.round() ?? _positionMs;
-    final String playTooltip = _playing
-        ? '暂停'
-        : _ended
-            ? '重新播放'
-            : '播放';
     const TextStyle timeStyle = TextStyle(
       color: Colors.white70,
       fontFeatures: [FontFeature.tabularFigures()],
@@ -731,42 +746,6 @@ class _ARDisplayRemotePageState extends State<ARDisplayRemotePage> {
               : null,
         ),
         const SizedBox(height: 8),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            GestureDetector(
-              onLongPress:
-                  canControl ? () => unawaited(_editSkipSeconds()) : null,
-              child: OutlinedButton.icon(
-                onPressed:
-                    canControl ? () => unawaited(_skipForward()) : null,
-                icon: const Icon(Icons.skip_next_rounded, size: 20),
-                label: Text('跳过 $_skipSeconds 秒'),
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: Colors.lightBlueAccent,
-                  side: const BorderSide(color: Colors.white24),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 10,
-                  ),
-                ),
-              ),
-            ),
-            const SizedBox(width: 28),
-            IconButton(
-              iconSize: 56,
-              color: Colors.white,
-              disabledColor: Colors.white24,
-              tooltip: playTooltip,
-              onPressed: canControl ? () => unawaited(_togglePlay()) : null,
-              icon: Icon(
-                _playing
-                    ? Icons.pause_circle_filled_rounded
-                    : Icons.play_circle_filled_rounded,
-              ),
-            ),
-          ],
-        ),
         const SizedBox(height: 8),
         _buildSpeedControl(canControl),
         const SizedBox(height: 8),
