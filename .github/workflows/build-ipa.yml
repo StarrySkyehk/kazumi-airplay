@@ -31,7 +31,7 @@ permissions:
 
 env:
   UPSTREAM_REPO: https://github.com/Predidit/Kazumi.git
-  UPSTREAM_SHA: 55e317e5f0c346d4318327ae0e5614eb8ee9097f
+  UPSTREAM_SHA: 7265274fac136a0cfe6ee32ea37f32f06ea57672
   DANDANAPI_APPID: ${{ secrets.DANDANAPI_APPID }}
   DANDANAPI_KEY: ${{ secrets.DANDANAPI_KEY }}
   KAZUMI_APPID: ${{ secrets.KAZUMI_APPID }}

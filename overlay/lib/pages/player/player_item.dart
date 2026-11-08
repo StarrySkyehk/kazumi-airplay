@@ -1343,8 +1343,8 @@ class _PlayerItemState extends State<PlayerItem>
     final bool superResolutionActive =
         playerController.playback.superResolutionMode !=
             SuperResolutionMode.off;
-    final String displayTitle = playerController.displayTitle.isNotEmpty
-        ? playerController.displayTitle
+    final String displayTitle = playerController.mediaTitle.isNotEmpty
+        ? playerController.mediaTitle
         : videoPageController.title;
     final List<ARDisplayDanmakuItem> danmaku = _buildArDisplayDanmaku();
     final Map<String, Object?> danmakuConfig = _buildArDanmakuConfig();

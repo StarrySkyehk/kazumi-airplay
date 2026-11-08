@@ -89,23 +89,10 @@ class PlayerController implements Disposable {
   late String referer;
   String? coverUrl;
   String videoUrl = '';
+  String _bangumiName = '';
+  String _episodeTitle = '';
   bool isLocalPlayback = false;
   Map<String, String> httpHeaders = const <String, String>{};
-  String episodeTitle = '';
-  String bangumiName = '';
-
-  /// 番剧名 + 剧集名，供 AR 眼镜遥控页展示。
-  String get displayTitle {
-    final episode = episodeTitle.trim();
-    final bangumi = bangumiName.trim();
-    if (bangumi.isEmpty) {
-      return episode;
-    }
-    if (episode.isEmpty) {
-      return bangumi;
-    }
-    return '$bangumi $episode';
-  }
 
   Timer? hideVolumeUITimer;
   Timer? _volumeGestureSyncTimer;
@@ -185,6 +172,13 @@ class PlayerController implements Disposable {
     unawaited(GStorage.putSetting<double>(SettingsKeys.defaultVolume, clamped));
   }
 
+  /// Describes [videoUrl], not the episode the page may still be resolving.
+  String get mediaTitle {
+    final episode =
+        _episodeTitle.isNotEmpty ? _episodeTitle : '第 $currentEpisode 集';
+    return _bangumiName.isEmpty ? episode : '$_bangumiName · $episode';
+  }
+
   Future<bool> init(PlaybackInitParams params) async {
     if (_initializations.isClosed) {
       return false;
@@ -193,6 +187,8 @@ class PlayerController implements Disposable {
     final initialization = _initializations.begin();
 
     videoUrl = params.videoUrl;
+    _bangumiName = params.bangumiName ?? '';
+    _episodeTitle = params.episodeTitle.trim();
     isLocalPlayback = params.isLocalPlayback;
     bangumiId = params.bangumiId;
     currentEpisode = params.episode;
@@ -200,8 +196,6 @@ class PlayerController implements Disposable {
     currentRoad = params.currentRoad;
     referer = params.referer;
     httpHeaders = params.httpHeaders;
-    episodeTitle = params.episodeTitle;
-    bangumiName = params.bangumiName ?? '';
 
     KazumiLogger().i(
         'PlayerController: ${params.isLocalPlayback ? "local" : "online"} playback, url: ${params.videoUrl}');
